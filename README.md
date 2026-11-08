@@ -1,6 +1,6 @@
 # AgentReliability-Platform
 
-面向工具型 AI Agent 的自动化测试与回归门禁。平台使用固定提交的电商数据分析 Agent 真实工作流，在合成订单库上离线运行用例，输出结构化报告与逐步轨迹。M1 覆盖正常、纠错与结果错误判定；M2 将正式离线套件扩展到 20 条，覆盖数据正确性、多轮会话、执行失败恢复与安全前置拦截。M3 增加静态 HTML 报告、基线与候选对比，以及 `agent-regression` PR 检查。
+面向工具型 AI Agent 的自动化测试与回归门禁。平台使用固定提交的电商数据分析 Agent 真实工作流，在合成订单库上离线运行用例，输出结构化报告与逐步轨迹。M1 覆盖正常、纠错与结果错误判定；M2 将正式离线套件扩展到 20 条，覆盖数据正确性、多轮会话、执行失败恢复与安全前置拦截。M3 增加静态 HTML 报告、基线与候选对比，以及 `agent-regression` PR 检查。M4 增加显式联网的真实模型抽样：固定模型与目标提交，对 6 条用例各跑 3 次，独立报告判定、耗时、调用次数与提供方错误。
 
 ## 环境准备
 
@@ -75,3 +75,27 @@ uv run --locked agentreliability run --mode offline --target-dir .targets/commer
 演示 PR [#1](https://github.com/super-ZXQ/AgentReliability-Platform/pull/1) 记录了远端红绿结果。红灯运行给候选注入演示变体，`agent-regression` 失败（候选退出 1、对比退出 1），20 个唯一用例 ID 完整覆盖，报告与对比产物仍上传：[运行 42461841558](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42461841558)。同一分支移除演示参数后恢复绿灯（基线、候选、对比均退出 0，20 条保持通过）：[运行 42462245235](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42462245235)。`--candidate-demo-fault` 仅用于该演示 PR，正式门禁不传此参数。
 
 本地验收在 `artifacts/m3/`：健康与恢复两次运行退出 0，注入运行退出 1，对比产出 REL-01、REL-02、REL-03 三条新增失败。远端 CI 的实际运行状态以对应 PR 的检查记录为准，两者分别记录。
+
+## 真实模型抽样
+
+真实模型模式必须显式开启联网，并从本地环境变量读取配置；报告只保存模型名与提供方主机，不保存密钥或完整地址。
+
+```sh
+export LLM_API_KEY=...
+export LLM_BASE_URL=https://<提供方>/v1
+export LLM_MODEL=<固定模型名>
+uv run --locked agentreliability run --mode live --allow-network --repeat 3 --target-dir .targets/commerce --out artifacts/m4/live
+```
+
+固定用例为 DATA-01、DATA-02、DATA-03、DATA-06、CONV-01、SEC-01，每条独立运行 3 次，共 18 次任务；每次试验重置会话与只读 SQLite 数据。缺失任一环境变量、未传 `--allow-network` 或目标 checkout 不可用时，命令写出 18 条 `NOT_RUN` 报告并以退出码 2 结束，不发起任何模型请求。全部通过时退出 0，业务断言失败退出 1，提供方连接、超时或限流等错误计入 `ERROR`。
+
+`report.json` 的 `live` 字段记录模型、提供方主机、重复次数与缺失环境；`case_summaries` 按用例汇总试验数、通过/失败/错误/未执行、平均与最大耗时、模型调用次数、重试次数、提供方错误数和 token 用量。真实报告与离线报告分开存放、分开判定。
+
+本地实测状态：当前机器未设置 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`，真实模式按设计写出 18 条 `NOT_RUN`，未伪造联网结果。配置齐全后重跑同一条命令即可生成真实抽样报告。
+
+## 三分钟演示
+
+1. 红灯：演示 PR 给候选注入缺失重试，`agent-regression` 检查失败（[运行 42461841558](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42461841558)）。打开 `artifacts/m3/comparison/comparison.html`，REL-01 被列为新增失败，候选执行只有一次 `error`。
+2. 轨迹定位：在 `artifacts/m3/injected/trace.jsonl` 中，REL-01 的 `sql_port` 在 `seq 167` 报错后，`seq 169` 直接进入 `agent` 的 `synthesize`；健康版在 `seq 167` 之后有 `seq 169` 的第二次 `model.generate_sql`，其 `previous_error` 为 `OperationalError：执行失败`，随后 `seq 172` 的 `sql_port` 成功。差异字段是 `executions`（期望两次、实际一次）与 `retry_context`（缺少第二次模型调用）。
+3. 绿灯：同一分支移除演示参数后检查通过（[运行 42462245235](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42462245235)），本地对照显示 REL-01、REL-02、REL-03 恢复，20 条保持通过。
+4. 真实模型：运行上述 `--mode live` 命令。若本机缺少凭据，展示 `artifacts/m4/live/report.html` 中 18 条 `NOT_RUN` 与具体缺失变量；配置齐全后同一页面展示 18 次任务的判定、耗时、调用次数和提供方错误。

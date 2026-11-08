@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shlex
 import sys
 from datetime import datetime, timezone
@@ -11,6 +12,14 @@ from uuid import uuid4
 
 from .compare import NOT_COMPARABLE, compare_reports, load_report, write_comparison
 from .html_report import render_run_html, write_html
+from .live import (
+    LIVE_CASE_IDS,
+    build_live_report,
+    not_run_live_results,
+    resolve_live_config,
+    run_live_cases_sync,
+    select_live_cases,
+)
 from .oracle import ERROR, FAIL, NOT_RUN
 from .report import build_report, write_artifacts
 from .runner import load_cases, not_run_results, run_cases_sync
@@ -21,8 +30,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentreliability")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser("run", help="运行离线用例并生成报告")
-    run_parser.add_argument("--mode", choices=["offline"], default="offline")
+    run_parser = subparsers.add_parser("run", help="运行离线或真实模型用例并生成报告")
+    run_parser.add_argument("--mode", choices=["offline", "live"], default="offline")
     run_parser.add_argument("--target-dir", required=True, help="固定提交的目标 checkout")
     run_parser.add_argument("--out", required=True, help="产物目录")
     run_parser.add_argument(
@@ -41,7 +50,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--demo-fault",
         choices=["disable-sql-retry"],
         default=None,
-        help="注入演示变体，仅用于门禁红绿演示",
+        help="注入演示变体，仅用于离线门禁红绿演示",
+    )
+    run_parser.add_argument(
+        "--allow-network",
+        action="store_true",
+        help="真实模型模式必须显式开启联网",
+    )
+    run_parser.add_argument(
+        "--repeat", type=int, default=1, help="真实模型模式每条用例的重复次数"
     )
 
     compare_parser = subparsers.add_parser(
@@ -66,6 +83,12 @@ def _exit_code(results: list[dict]) -> int:
 
 
 def _run(args: argparse.Namespace, raw_argv: list[str]) -> int:
+    if args.repeat != 1:
+        print("离线模式仅支持 --repeat 1", file=sys.stderr)
+        return 2
+    if args.allow_network:
+        print("离线模式不接受 --allow-network", file=sys.stderr)
+        return 2
     cases_path = Path(args.cases)
     fixture_path = Path(args.fixture)
     out_dir = Path(args.out)
@@ -172,6 +195,184 @@ def _run(args: argparse.Namespace, raw_argv: list[str]) -> int:
     return _exit_code(results)
 
 
+def _emit_live_not_run(
+    *,
+    args: argparse.Namespace,
+    raw_argv: list[str],
+    cases: list[dict],
+    requested: list[str],
+    repeat: int,
+    target,
+    missing: list[str],
+    reason: str,
+) -> int:
+    run_id = uuid4().hex
+    started_at = datetime.now(timezone.utc)
+    results = not_run_live_results(cases, repeat, reason)
+    report = build_live_report(
+        run_id=run_id,
+        target=target,
+        cases_path=Path(args.cases),
+        fixture_path=Path(args.fixture),
+        results=results,
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc),
+        command=_command(raw_argv),
+        repeat=repeat,
+        requested_cases=requested,
+        config=None,
+        missing=missing,
+        reason=reason,
+    )
+    report_path, trace_path = write_artifacts(Path(args.out), report, [])
+    html_path = write_html(Path(args.out) / "report.html", render_run_html(report, []))
+    print(f"NOT_RUN 总计 {len(results)}：{reason}", file=sys.stderr)
+    print(f"报告：{report_path}")
+    print(f"轨迹：{trace_path}")
+    print(f"HTML：{html_path}")
+    return 2
+
+
+def _run_live(args: argparse.Namespace, raw_argv: list[str]) -> int:
+    if args.repeat < 1:
+        print("--repeat 必须大于等于 1", file=sys.stderr)
+        return 2
+    if args.demo_fault:
+        print("演示变体仅用于离线模式", file=sys.stderr)
+        return 2
+
+    cases_path = Path(args.cases)
+    fixture_path = Path(args.fixture)
+    lock_path = Path(args.target_lock)
+    out_dir = Path(args.out)
+
+    if not cases_path.exists():
+        print(f"用例文件不存在：{cases_path}", file=sys.stderr)
+        return 2
+    if not fixture_path.exists():
+        print(f"数据种子文件不存在：{fixture_path}", file=sys.stderr)
+        return 2
+    if not lock_path.exists():
+        print(f"目标锁文件不存在：{lock_path}", file=sys.stderr)
+        return 2
+
+    try:
+        cases = load_cases(cases_path)
+    except (OSError, ValueError) as exc:
+        print(f"用例加载失败：{exc}", file=sys.stderr)
+        return 2
+
+    live_cases = select_live_cases(cases)
+    missing_cases = [
+        case_id
+        for case_id in LIVE_CASE_IDS
+        if case_id not in {case["case_id"] for case in live_cases}
+    ]
+    if missing_cases:
+        print(f"真实模式缺少用例：{'、'.join(missing_cases)}", file=sys.stderr)
+        return 2
+
+    if args.case_id:
+        if args.case_id not in LIVE_CASE_IDS:
+            print(
+                f"真实模式不支持用例：{args.case_id}；可选 {', '.join(LIVE_CASE_IDS)}",
+                file=sys.stderr,
+            )
+            return 2
+        live_cases = [case for case in live_cases if case["case_id"] == args.case_id]
+        requested = [args.case_id]
+    else:
+        requested = list(LIVE_CASE_IDS)
+
+    try:
+        target = verify_target(Path(args.target_dir), lock_path)
+    except TargetError as exc:
+        return _emit_live_not_run(
+            args=args,
+            raw_argv=raw_argv,
+            cases=live_cases,
+            requested=requested,
+            repeat=args.repeat,
+            target=None,
+            missing=[],
+            reason=f"目标 checkout 不可用：{exc}",
+        )
+
+    if not args.allow_network:
+        return _emit_live_not_run(
+            args=args,
+            raw_argv=raw_argv,
+            cases=live_cases,
+            requested=requested,
+            repeat=args.repeat,
+            target=target,
+            missing=[],
+            reason="未显式传入 --allow-network，已拒绝联网",
+        )
+
+    config, missing_env = resolve_live_config(os.environ)
+    if config is None:
+        return _emit_live_not_run(
+            args=args,
+            raw_argv=raw_argv,
+            cases=live_cases,
+            requested=requested,
+            repeat=args.repeat,
+            target=target,
+            missing=missing_env,
+            reason=f"缺少环境变量：{'、'.join(missing_env)}",
+        )
+
+    run_id = uuid4().hex
+    started_at = datetime.now(timezone.utc)
+    results, trace_events = run_live_cases_sync(
+        live_cases,
+        target=target,
+        fixture_sql=fixture_path.read_text(encoding="utf-8"),
+        run_id=run_id,
+        repeat=args.repeat,
+        config=config,
+    )
+    report = build_live_report(
+        run_id=run_id,
+        target=target,
+        cases_path=cases_path,
+        fixture_path=fixture_path,
+        results=results,
+        started_at=started_at,
+        finished_at=datetime.now(timezone.utc),
+        command=_command(raw_argv),
+        repeat=args.repeat,
+        requested_cases=requested,
+        config=config,
+        missing=[],
+    )
+    report_path, trace_path = write_artifacts(out_dir, report, trace_events)
+    html_path = write_html(
+        out_dir / "report.html", render_run_html(report, trace_events)
+    )
+
+    for result in results:
+        print(
+            f"{result['verdict']} {result['case_id']} trial={result['trial']} "
+            f"({result['duration_ms']} ms)"
+        )
+    summary = report["summary"]
+    print(
+        f"{summary['verdict']} 总计 {summary['total']}，"
+        f"通过 {summary['pass']}，失败 {summary['fail']}，"
+        f"错误 {summary['error']}，未执行 {summary['not_run']}"
+    )
+    print(
+        f"模型 {config.model}（{config.provider_host or '未知主机'}），"
+        f"每条用例 {args.repeat} 次，共 {len(results)} 次任务"
+    )
+    print(f"报告：{report_path}")
+    print(f"轨迹：{trace_path}")
+    print(f"HTML：{html_path}")
+    return _exit_code(results)
+
+
 def _comparison_error(
     out_dir: Path, command: str, reasons: list[str]
 ) -> tuple[int, Path, Path]:
@@ -251,6 +452,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(raw_argv)
     try:
         if args.command == "run":
+            if args.mode == "live":
+                return _run_live(args, raw_argv)
             return _run(args, raw_argv)
         if args.command == "compare":
             return _run_compare(args, raw_argv)

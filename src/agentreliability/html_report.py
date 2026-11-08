@@ -86,22 +86,67 @@ def _cards(summary: dict[str, Any]) -> str:
 def _meta_rows(report: dict[str, Any]) -> str:
     target = report.get("target") or {}
     inputs = report.get("inputs") or {}
+    live = report.get("live") or {}
     rows = [
         ("run_id", report.get("run_id")),
         ("运行模式", report.get("mode")),
         ("变体", report.get("variant") or "默认（无注入）"),
         ("用例选择", report.get("selection") or "完整套件"),
-        ("目标仓库", target.get("repository")),
-        ("目标提交", target.get("commit")),
-        ("判定器版本", report.get("oracle_version")),
-        ("用例 SHA-256", inputs.get("cases_sha256")),
-        ("数据 SHA-256", inputs.get("fixture_sha256")),
-        ("开始时间", report.get("started_at")),
-        ("结束时间", report.get("finished_at")),
     ]
+    if live:
+        model = live.get("model") or {}
+        environment = live.get("environment") or {}
+        rows.extend(
+            [
+                ("模型", model.get("name") or "未配置"),
+                ("提供方主机", model.get("provider_host") or "未配置"),
+                ("重复次数", live.get("repeat")),
+                ("环境缺失", "、".join(environment.get("missing") or []) or "无"),
+                ("未执行原因", environment.get("reason") or "无"),
+            ]
+        )
+    rows.extend(
+        [
+            ("目标仓库", target.get("repository")),
+            ("目标提交", target.get("commit")),
+            ("判定器版本", report.get("oracle_version")),
+            ("用例 SHA-256", inputs.get("cases_sha256")),
+            ("数据 SHA-256", inputs.get("fixture_sha256")),
+            ("开始时间", report.get("started_at")),
+            ("结束时间", report.get("finished_at")),
+        ]
+    )
     return "".join(
         f"<div><span class=\"muted\">{_e(label)}：</span><code>{_e(value)}</code></div>"
         for label, value in rows
+    )
+
+
+def _case_summary_table(summaries: list[dict[str, Any]]) -> str:
+    if not summaries:
+        return ""
+    rows = "".join(
+        "<tr>"
+        f"<td>{_e(item.get('case_id'))}</td>"
+        f"<td>{_e(item.get('trials'))}</td>"
+        f"<td>{_e(item.get('pass'))}</td>"
+        f"<td>{_e(item.get('fail'))}</td>"
+        f"<td>{_e(item.get('error'))}</td>"
+        f"<td>{_e(item.get('not_run'))}</td>"
+        f"<td>{_e((item.get('latency_ms') or {}).get('average'))}</td>"
+        f"<td>{_e((item.get('latency_ms') or {}).get('max'))}</td>"
+        f"<td>{_e(item.get('model_calls'))}</td>"
+        f"<td>{_e(item.get('retries'))}</td>"
+        f"<td>{_e(item.get('provider_errors'))}</td>"
+        f"<td>{_e((item.get('usage') or {}).get('total_tokens'))}</td>"
+        "</tr>"
+        for item in summaries
+    )
+    return (
+        "<table><thead><tr><th>用例</th><th>试验</th><th>通过</th><th>失败</th>"
+        "<th>错误</th><th>未执行</th><th>平均耗时 ms</th><th>最大耗时 ms</th>"
+        "<th>模型调用</th><th>重试</th><th>提供方错误</th><th>总 token</th></tr></thead>"
+        f"<tbody>{rows}</tbody></table>"
     )
 
 
@@ -147,7 +192,14 @@ def _trace_table(events: list[dict[str, Any]]) -> str:
     for event in events:
         payload = {
             key: event[key]
-            for key in ("sql", "failure", "previous_error", "history")
+            for key in (
+                "sql",
+                "failure",
+                "previous_error",
+                "history",
+                "usage",
+                "provider_error",
+            )
             if key in event
         }
         if payload:
@@ -164,6 +216,17 @@ def render_run_html(
     summary = report.get("summary") or {}
     trace_by_seq = {event.get("seq"): event for event in trace_events}
     command = str(report.get("command") or "")
+    title = (
+        "AgentReliability 真实模型报告"
+        if report.get("mode") == "live"
+        else "AgentReliability 离线报告"
+    )
+    summaries = report.get("case_summaries") or []
+    summary_section = (
+        f"<h2>每条用例汇总</h2>{_case_summary_table(summaries)}"
+        if summaries
+        else ""
+    )
     blocks: list[str] = []
     for case in report.get("cases", []):
         case_id = str(case.get("case_id"))
@@ -195,14 +258,15 @@ def render_run_html(
         )
 
     body = (
-        f"<h1>AgentReliability 离线报告</h1>"
+        f"<h1>{_e(title)}</h1>"
         f"<p class=\"muted\">同一份用例与数据上的真实 AgentRuntime 执行结果。</p>"
         f"<div class=\"meta\">{_meta_rows(report)}</div>"
         f"<h2>摘要</h2>{_cards(summary)}"
+        f"{summary_section}"
         f"<h2>复现命令</h2><pre>{_e(command)}</pre>"
         f"<h2>用例</h2>{''.join(blocks)}"
     )
-    return _page("AgentReliability 离线报告", body)
+    return _page(title, body)
 
 
 def render_compare_html(comparison: dict[str, Any]) -> str:

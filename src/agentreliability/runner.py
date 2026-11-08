@@ -7,7 +7,7 @@ import json
 import time
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .adapter import build_runtime, new_conversations
 from .db import SqlitePort
@@ -118,6 +118,9 @@ async def run_case(
     trace: TraceCollector,
     trial: int = 1,
     variant: str | None = None,
+    model_factory: Callable[[int], Any] | None = None,
+    observation_extra: Callable[[], dict[str, Any]] | None = None,
+    judge: Callable[[dict[str, Any], dict[str, Any]], dict[str, Any]] = judge_case,
 ) -> dict[str, Any]:
     case_id = str(case["case_id"])
     turns = _turns(case)
@@ -148,14 +151,17 @@ async def run_case(
 
         for turn_number, turn in enumerate(turns, start=1):
             sql_port.round_no = turn_number
-            model = ScriptedModel(
-                sql_script=list(turn.get("sql_script", [])),
-                answer=str(turn.get("answer", "")),
-                trace=trace,
-                case_id=case_id,
-                trial=trial,
-                round_no=turn_number,
-            )
+            if model_factory is not None:
+                model = model_factory(turn_number)
+            else:
+                model = ScriptedModel(
+                    sql_script=list(turn.get("sql_script", [])),
+                    answer=str(turn.get("answer", "")),
+                    trace=trace,
+                    case_id=case_id,
+                    trial=trial,
+                    round_no=turn_number,
+                )
             runtime = build_runtime(
                 target=target,
                 sql_port=sql_port,
@@ -233,7 +239,10 @@ async def run_case(
         if sql_port is not None:
             sql_port.close()
 
-    judged = judge_case(case, observation)
+    if observation_extra is not None:
+        observation.update(observation_extra())
+
+    judged = judge(case, observation)
     duration_ms = max(0, round((time.perf_counter() - started) * 1000))
     actual: dict[str, Any] = {
         "rows": observation.get("rows", []),
@@ -269,7 +278,17 @@ async def run_case(
         ],
         "turns": observation.get("turns", []),
     }
-    for key in ("answer", "sql", "sql_error", "intent", "usage", "error"):
+    for key in (
+        "answer",
+        "sql",
+        "sql_error",
+        "intent",
+        "usage",
+        "error",
+        "provider_errors",
+        "model_answer_calls",
+        "retry_count",
+    ):
         if key in observation:
             actual[key] = observation[key]
 
