@@ -1,6 +1,6 @@
 # AgentReliability-Platform
 
-面向工具型 AI Agent 的自动化测试与回归门禁。平台使用固定提交的电商数据分析 Agent 真实工作流，在合成订单库上离线运行用例，输出结构化报告与逐步轨迹。M1 覆盖正常、纠错与结果错误判定；M2 将正式离线套件扩展到 20 条，覆盖数据正确性、多轮会话、执行失败恢复与安全前置拦截。M3 增加静态 HTML 报告、基线与候选对比，以及 `agent-regression` PR 检查。M4 增加显式联网的真实模型抽样：固定模型与目标提交，对 6 条用例各跑 3 次，独立报告判定、耗时、调用次数与提供方错误。
+面向工具型 AI Agent 的自动化测试与回归门禁。平台使用固定提交的电商数据分析 Agent 真实工作流，在合成订单库上离线运行用例，输出结构化报告与逐步轨迹。M1 覆盖正常、纠错与结果错误判定；M2 将正式离线套件扩展到 20 条，覆盖数据正确性、多轮会话、执行失败恢复与安全前置拦截。M3 增加静态 HTML 报告、基线与候选对比，以及 `agent-regression` PR 检查。M4 增加显式联网的真实模型抽样：固定模型与目标提交，对 6 条用例各跑 3 次，独立报告判定、耗时、调用次数与提供方错误。平台化阶段增加 `quality` 闭环（静态扫描、故障复现、离线调查、Docker 补丁复测）、OpenJudge 语义评分、2×2 模型矩阵与 A.I.G MCP 扫描适配。
 
 ## 环境准备
 
@@ -68,6 +68,46 @@ uv run --locked agentreliability quality --scenario orders-slow-query --out arti
 扫描器锁定在 VibeCheck-AI `3a0e22c7e49eb317cbecb80c4d7616668938300e`，通过其后端虚拟环境在独立进程执行真实 `app.scanner.sensitive.scan_directory`。调查由平台拥有的脚本在 IncidentPilot 虚拟环境内调用上游 `run_agent_workflow`，模型与工具为上游脚本化替身（`offline-scripted`）；Docker 复测为真实容器（`real-docker`）。预计根因只用于验证器比对，不注入被测 Agent。
 
 闭环结论不是“所有子任务都通过”：`failure_assertion` 必须以 `FAIL` 命中注入故障，随后调查、补丁与两项复测通过，且人工审批保持 `NOT_RUN`，才输出 `PASS` 供人工审核。提交错配、缺失产物、超时、上游失败、未复现故障或 Docker 不可用都不会生成通过状态。
+
+## 语义评分（OpenJudge）
+
+语义评分独立展示，不参与离线硬门禁；硬门禁仍由确定性断言负责。样本冻结在 `benchmarks/semantic_groundedness/v1.json`，清单记录样本 SHA-256、校准/留出划分与标签来源。
+
+```sh
+uv run --locked agentreliability semantic --split calibration --mode offline --openjudge-dir .targets/openjudge --out artifacts/platform/semantic
+```
+
+OpenJudge 固定在 `b83f446b09821257da9c2070ca405fa71cc22690`，使用其独立虚拟环境在子进程运行 `ReasoningGroundednessGrader`。`offline` 模式注入词面覆盖测试替身，只验证适配器与计分链路（`execution_mode=test-double`）；`model` 模式读取 `OPENJUDGE_API_KEY`（或 `LLM_API_KEY`）、`OPENJUDGE_MODEL`（或 `LLM_MODEL`）与可选 `OPENJUDGE_BASE_URL`。缺失配置时写出 `NOT_RUN` 并以退出码 2 结束。留出集指标还要求 `manifest.json` 中 `labels_human_reviewed=true`，当前标签为项目编写、尚未人审，因此留出集命令按设计返回 `NOT_RUN`。
+
+每次运行写入 `runs/<UTC 时间>-<运行 ID>/`：`samples.json`、`predictions.json`、`manifest.json` 与 `report.html`。报告分别给出清晰样本一致率、边界样本分布、误判与分歧例。
+
+## 2×2 矩阵
+
+矩阵清单 `benchmarks/matrix/pawbench-2x2.json` 固定两个模型槽、`fixed`/`autonomous` 两种策略、两个故障场景、每组合 2 次重复，以及判定器和预算；参考 PawBench `0f794a8bb6c27aa9ee4091b2691fa30e4ed9cc8f` 的重复运行结构，本矩阵不是 PawBench 官方榜单。
+
+```sh
+uv run --locked agentreliability matrix --mode offline --out artifacts/platform/matrix
+```
+
+IncidentPilot 默认查找 `.targets/incidentpilot` 或 `~/Developer/GitHub/incidentpilot`，也可用 `--incidentpilot-dir` 指定锁定提交的 checkout。离线模式在 IncidentPilot 独立环境运行 `workflow_fake`（脚本化模型与合成工具，不联网、不启用沙箱），验证 16 次试验的调度、预算、汇总与失败展示。真实矩阵需要两个独立授权模型配置：`PAWBENCH_MODEL_A_API_KEY`/`_MODEL`/`_BASE_URL` 与 `PAWBENCH_MODEL_B_API_KEY`/`_MODEL`/`_BASE_URL`；缺失时 `--mode model` 写出 `NOT_RUN` 并以退出码 2 结束。
+
+产物包含 `trials.json`、`manifest.json`（按模型 × 策略与场景汇总、真实矩阵待补状态）和 `report.html`。
+
+## A.I.G MCP 扫描
+
+```sh
+export AIG_BASE_URL=http://localhost:8088
+uv run --locked agentreliability aig --out artifacts/platform/aig-real
+```
+
+A.I.G 固定在 `76146bf479b2fedb34f7acb7f536aa37b1f8ba74`，流程为上传白名单 ZIP → 创建 `mcp_scan` 任务 → 有界轮询状态 → 拉取结果并统一展示发现。样例位于 `benchmarks/aig_samples/synthetic_mcp_server`，只含合成源码，上传时会跳过隐藏文件与非白名单后缀。实例地址缺失或不可达时写出 `NOT_RUN`；轮询超时、任务失败、统一响应 `status=1` 或结果解析失败都会写出 `ERROR`，不会生成通过状态。电商 SEC 断言仍由既有确定性套件独立负责。
+
+## 平台化阶段报告
+
+完整阶段报告（逐项状态、命令、退出码、负向证明与待补验清单）：
+
+- `artifacts/platform/phase-report/report.html`
+- `artifacts/platform/verification.json`
 
 ## 对比与红绿复现
 
