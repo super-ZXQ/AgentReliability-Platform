@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from ._incidentpilot_matrix import ReferenceResetError, local_reference_endpoint, reset_reference
 from .html_report import _CSS, _badge, _e, _json
 from .oracle import ERROR, NOT_RUN, PASS
 from .quality import _checkout_state, resolve_incidentpilot_dir
@@ -312,7 +313,7 @@ def real_result_verdict(
     issues: list[str],
 ) -> tuple[str, str | None, str | None]:
     """真实模式的唯一放行路径：无试验 → NOT_RUN；校验不通过 → ERROR。"""
-    if not trials:
+    if not trials and not (payload.get("errors") or payload.get("error")):
         return (
             NOT_RUN,
             STATE_REAL_ENV_UNAVAILABLE,
@@ -446,6 +447,7 @@ def run_matrix(
         url = reference_orders_api(environ)
         probe = reference_probe or _default_reference_probe
         try:
+            local_reference_endpoint(url)
             reachable, detail = probe(url, 5.0)
         except Exception as exc:  # noqa: BLE001 - 环境探测失败即视为不可用
             reachable, detail = False, f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -520,6 +522,11 @@ def run_matrix(
     except subprocess.TimeoutExpired:
         manifest["state"] = STATE_TIMEOUT
         manifest["error"] = f"矩阵执行超时（>{timeout}s）"
+        if mode == "model":
+            try:
+                reset_reference(url)
+            except ReferenceResetError as exc:
+                manifest["error"] += f"。{exc}"
         return _finish(manifest, run_dir, [], root)
     except OSError as exc:
         manifest["state"] = STATE_UNAVAILABLE
@@ -561,6 +568,8 @@ def run_matrix(
         manifest["status"] = status
         manifest["state"] = state
         if error:
+            if payload.get("error"):
+                error += "：" + str(payload["error"])
             if not trials and errors:
                 error += "：" + "；".join(
                     str(item.get("error") or item) for item in errors[:3]

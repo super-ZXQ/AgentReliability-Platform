@@ -12,7 +12,10 @@ import os
 import sys
 import tempfile
 import traceback
+from contextlib import contextmanager, nullcontext
 from dataclasses import asdict
+from http.client import HTTPConnection
+from urllib.parse import urlsplit
 from pathlib import Path
 
 
@@ -47,6 +50,47 @@ def _reference_api(environ: dict) -> str:
         or environ.get("REFERENCE_ORDERS_API_URL")
         or "http://127.0.0.1:8001"
     )
+
+
+class ReferenceResetError(RuntimeError):
+    pass
+
+
+def local_reference_endpoint(url: str):
+    endpoint = urlsplit(url)
+    if (
+        endpoint.scheme != "http"
+        or endpoint.hostname not in {"127.0.0.1", "::1"}
+        or endpoint.username is not None
+        or endpoint.path not in {"", "/"}
+        or endpoint.query
+        or endpoint.fragment
+    ):
+        raise ValueError("故障注入仅支持专用的本地 reference API（HTTP 回环地址）")
+    return endpoint
+
+
+def reset_reference(url: str) -> None:
+    endpoint = local_reference_endpoint(url)
+    connection = HTTPConnection(endpoint.hostname, endpoint.port, timeout=5)
+    try:
+        connection.request("POST", "/admin/fault/reset")
+        response = connection.getresponse()
+        if response.status != 200 or json.loads(response.read(4096)) != {"status": "reset"}:
+            raise ValueError(f"reference API 未确认重置（HTTP {response.status}）")
+    except Exception as exc:
+        raise ReferenceResetError(f"无法确认 reference 故障已清除：{exc}") from exc
+    finally:
+        connection.close()
+
+
+@contextmanager
+def clean_reference(url: str):
+    reset_reference(url)
+    try:
+        yield
+    finally:
+        reset_reference(url)
 
 
 async def _load_root_cause(run_id: str | None) -> dict:
@@ -126,8 +170,10 @@ async def run_trial(
             strategy=strategy,
         )
         try:
-            outcome = await harness.run_case(case)
-            predicted_root_cause = await _load_root_cause(outcome.run_id)
+            reference = clean_reference(_reference_api(environ)) if mode == "model" else nullcontext()
+            with reference:
+                outcome = await harness.run_case(case)
+                predicted_root_cause = await _load_root_cause(outcome.run_id)
         finally:
             await dispose_engine()
         record = asdict(outcome)
@@ -230,6 +276,8 @@ async def main_async(root: Path, spec: dict, mode: str, environ: dict) -> dict:
                                 environ=environ,
                             )
                         )
+                    except ReferenceResetError:
+                        raise
                     except Exception as exc:  # noqa: BLE001
                         errors.append(
                             {

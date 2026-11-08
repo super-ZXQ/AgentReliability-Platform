@@ -27,40 +27,31 @@ def _tail(text: str, limit: int = 2000) -> str:
     return (text or "")[-limit:]
 
 
-def _causal_facts_coverage(
-    ground_truth, root_cause: dict
-) -> tuple[bool, list[dict]]:
-    """逐条核验关键因果事实：至少一条事实的实质词覆盖达到一半。
+def _causal_facts_coverage(ground_truth, root_cause: dict) -> tuple[bool, list[dict]]:
+    """Verify an affirmative mechanism for the fixed slow-query scenario."""
+    summary = str(root_cause.get("summary") or "").lower()
+    mechanism = re.fullmatch(
+        r"(?:the )?slow database (?:path|query) (?:adds request delay|"
+        r"delays (?:the )?/orders (?:request|response))"
+        r"|(?:the )?/orders handler sleeps (?:on|due to) "
+        r"(?:a slow database query|(?:the )?injected slow_database_query fault)"
+        r"(?:, (?:raising|increasing) (?:p95 )?latency)?",
+        summary.strip().rstrip("."),
+    )
+    supported = bool(ground_truth.get("causal_facts") and mechanism)
+    return supported, [{"mechanism": FAULT_TYPE, "matched": supported}]
 
-    上游结构化评分对事实只做“任一关键词命中”的宽松判断，容易放过
-    只重复 orders/latency 等泛词但机制错误的解释。判定器在此加严。
-    """
-    facts = [str(item).lower() for item in (ground_truth.get("causal_facts") or [])]
-    if not facts:
-        return False, []
-    text = " ".join(
-        [
-            str(root_cause.get("summary") or ""),
-            *[str(item) for item in root_cause.get("causal_facts") or []],
-        ]
-    ).lower()
-    covered: list[dict] = []
-    for fact in facts:
-        tokens = {token for token in re.split(r"[^a-z0-9_]+", fact) if len(token) > 3}
-        if not tokens:
-            continue
-        hits = sorted(token for token in tokens if token in text)
-        ratio = len(hits) / len(tokens)
-        covered.append(
-            {
-                "fact": fact,
-                "tokens": sorted(tokens),
-                "hits": hits,
-                "ratio": round(ratio, 4),
-            }
-        )
-    supported = any(item["ratio"] >= 0.5 for item in covered)
-    return supported, covered
+
+def _cites_slow_query_code(result: dict) -> bool:
+    """Require cited source to show the injected branch actually sleeping."""
+    path = str(result.get("path") or "").replace("\\", "/")
+    if path != "app.py" and not path.endswith("/orders_api/app.py"):
+        return False
+    return bool(re.search(
+        r"""(?m)^([ \t]*)if ftype (?:==|in) [^\n]*["']slow_database_query["'][^\n]*:\s*\n"""
+        r"\1[ \t]+time\.sleep\(",
+        str(result.get("content") or ""),
+    ))
 
 
 def _iso(value) -> str | None:
@@ -273,9 +264,12 @@ async def run_workflow(root: Path, reference_dir: Path, tmp: Path, case) -> dict
         "evidence_bound_to_diagnosis": bool(structured["evidence_bound"]),
         "cited_evidence_sources": cited_sources,
         "evidence_supports_conclusion": bool(
-            cited
-            and len(cited_sources) >= 2
-            and set(cited_sources) & expected_sources
+            structured["evidence_bound"]
+            and any(
+                call_names.get(item.tool_call_id) == "read_source_code"
+                and _cites_slow_query_code(item.result or {})
+                for item in cited
+            )
         ),
         "expected_evidence_sources": sorted(expected_sources),
         "observed_evidence_sources": sorted(observed_sources),

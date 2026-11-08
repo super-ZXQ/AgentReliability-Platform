@@ -123,13 +123,15 @@ class AigClient:
             status, payload, _headers = self.transport(
                 method, self.base_url + path, body, headers, self.timeout
             )
+        except urllib.error.HTTPError as exc:
+            raise AigError(STATE_SERVICE_FAILURE, f"A.I.G 返回 HTTP {exc.code}") from exc
         except urllib.error.URLError as exc:
             raise AigError(STATE_UNREACHABLE, f"无法连接 A.I.G：{exc.reason}") from exc
         except TimeoutError as exc:
             raise AigError(STATE_SERVICE_FAILURE, f"A.I.G 请求超时：{exc}") from exc
         except OSError as exc:
             raise AigError(STATE_UNREACHABLE, f"无法连接 A.I.G：{exc}") from exc
-        if status >= 500:
+        if status >= 400:
             raise AigError(STATE_SERVICE_FAILURE, f"A.I.G 返回 HTTP {status}")
         try:
             envelope = json.loads(payload.decode("utf-8"))

@@ -135,8 +135,10 @@ uv run --locked agentreliability matrix --mode offline --incidentpilot-dir ~/Dev
 本轮修复真实矩阵、根因验证与 A.I.G 上传三处误报，证据在新目录 `artifacts/release-fix-20261108/`，历史 `artifacts/release-acceptance/` 原样保留：
 
 1. **真实矩阵**：`matrix --mode model` 只走真实模型执行路径（`tier=real_llm_investigation`、`tool_backend=mcp`），两个模型槽分别读取 `PAWBENCH_MODEL_A_*` / `PAWBENCH_MODEL_B_*`。发布真实结果前逐条校验执行来源、模型标识与 provider 元数据；任一条来自脚本化替身即 `ERROR`（`matrix_real_result_invalid`），真实执行器或 reference API / MCP 环境不可用时返回 `NOT_RUN` 且退出码 2，不再产出 `real-service PASS`。
-2. **根因验证**：判定器核验根因 `verified` 状态、关键因果事实覆盖率，以及根因实际声明的证据是否支持结论；缺引用、引用无关证据、因果事实错误均判 `REVIEW_REQUIRED` 并退出 1。桥接层不再在根因缺引用时用本轮全部证据补齐；Docker 补丁复测结果仍独立记录为 `PASS`。
+2. **根因验证**：判定器核验根因 `verified` 状态、订单慢查询场景的明确故障机制，以及实际引用的源码是否显示注入分支执行延迟；缺引用、引用无关证据、因果事实错误均判 `REVIEW_REQUIRED` 并退出 1。桥接层不再在根因缺引用时用本轮全部证据补齐；Docker 补丁复测结果仍独立记录为 `PASS`。
 3. **A.I.G 上传**：`build_source_zip` 拒绝符号链接，并校验每个入包文件解析后的真实路径位于样例根目录内；目录外内容既不会进入 ZIP，也不会传给上传接口。
+
+真实矩阵使用专用本地 reference API，地址需为 HTTP 回环地址（默认 `http://127.0.0.1:8001`）。每次试验开始和结束都确认故障重置。子进程超时后由父进程补做重置。清理失败会结束矩阵并报错。A.I.G 收到 HTTP 失败响应时记录状态码并返回 `ERROR`，连接失败则返回 `NOT_RUN`。
 
 离线负例集中在 `tests/test_release_boundaries.py`（无需真实模型凭据与外部服务），已接入 PR 工作流的 `agent-regression` 检查，原有 20 条离线门禁保留。
 

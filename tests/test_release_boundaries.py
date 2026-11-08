@@ -228,3 +228,118 @@ def test_aig_symlink_outside_root_never_enters_zip_or_upload(tmp_path):
     with zipfile.ZipFile(io.BytesIO(body[start:end])) as archive:
         assert archive.namelist() == ["server.py"]
         assert b"OUTSIDE_SECRET" not in archive.read("server.py")
+
+
+def test_diagnosis_requires_affirmative_mechanism_and_source_evidence():
+    from agentreliability._incidentpilot_run import (
+        _causal_facts_coverage,
+        _cites_slow_query_code,
+    )
+
+    truth = {"causal_facts": ["slow database path adds request delay", "orders endpoint P95 latency increases"]}
+    for summary in (
+        "orders endpoint P95 latency increases because of dependency timeout configuration",
+        "The slow database path did not add request delay",
+    ):
+        matched, _ = _causal_facts_coverage(truth, {"summary": summary})
+        assert quality._diagnosis_assessment(
+            _diagnosis(causal_facts_match=matched)
+        )["status"] == quality.REVIEW_REQUIRED
+    matched, _ = _causal_facts_coverage(truth, {"summary": "Slow database query adds request delay."})
+    assert matched
+    assert not _cites_slow_query_code({"path": "app.py", "content": "time.sleep(0.5)"})
+    assert _cites_slow_query_code({
+        "path": "app.py",
+        "content": 'if ftype in {"slow_database_query", "dependency_timeout"}:\n    time.sleep(0.5)',
+    })
+
+
+def test_default_aig_transport_distinguishes_http_errors(tmp_path):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.send_error(self.server.error_code)
+
+        def log_message(self, *_args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        url = f"http://127.0.0.1:{server.server_port}"
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for code in (500, 502):
+                server.error_code = code
+                report, _ = run_aig_scan(out=tmp_path, base_url=url, timeout=2)
+                assert report["status"] == ERROR
+                assert f"HTTP {code}" in report["error"]
+        finally:
+            server.shutdown()
+            thread.join()
+    report, _ = run_aig_scan(out=tmp_path, base_url=url, timeout=2)
+    assert report["status"] == NOT_RUN
+
+
+def test_reference_cleanup_covers_reproduction_failure():
+    from http.client import HTTPConnection
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    import pytest
+
+    from agentreliability._incidentpilot_matrix import (
+        ReferenceResetError,
+        clean_reference,
+        local_reference_endpoint,
+    )
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/admin/fault":
+                self.server.injected = True
+                self.send_response(200)
+                self.end_headers()
+            elif self.server.reject_reset:
+                self.send_error(503)
+            else:
+                self.server.injected = False
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"status": "reset"}')
+
+        def do_GET(self):
+            self.send_response(503 if self.server.injected else 200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    with pytest.raises(ValueError, match="回环"):
+        local_reference_endpoint("http://example.invalid")
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.injected = True
+        server.reject_reset = False
+        url = f"http://127.0.0.1:{server.server_port}"
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = HTTPConnection("127.0.0.1", server.server_port, timeout=2)
+        try:
+            with pytest.raises(RuntimeError, match="503"):
+                with clean_reference(url):
+                    assert not server.injected
+                    connection.request("POST", "/admin/fault")
+                    assert connection.getresponse().status == 200
+                    connection.request("GET", "/orders")
+                    assert connection.getresponse().status == 503
+                    raise RuntimeError("reproduction failed with 503")
+            assert not server.injected
+            with pytest.raises(ReferenceResetError):
+                with clean_reference(url):
+                    server.reject_reset = True
+        finally:
+            connection.close()
+            server.shutdown()
+            thread.join()
+    assert real_result_verdict([], {"status": ERROR, "error": "reset failed"}, [])[0] == ERROR
