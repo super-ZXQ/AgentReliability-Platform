@@ -72,4 +72,6 @@ uv run --locked agentreliability run --mode offline --target-dir .targets/commer
 
 将检查设为分支保护规则：在仓库 Settings → Branches 中为 `main` 启用规则，并要求 `agent-regression` 通过后才能合并。
 
+演示 PR [#1](https://github.com/super-ZXQ/AgentReliability-Platform/pull/1) 记录了远端红绿结果。红灯运行给候选注入演示变体，`agent-regression` 失败（候选退出 1、对比退出 1），20 个唯一用例 ID 完整覆盖，报告与对比产物仍上传：[运行 42461841558](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42461841558)。同一分支移除演示参数后恢复绿灯（基线、候选、对比均退出 0，20 条保持通过）：[运行 42462245235](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42462245235)。`--candidate-demo-fault` 仅用于该演示 PR，正式门禁不传此参数。
+
 本地验收在 `artifacts/m3/`：健康与恢复两次运行退出 0，注入运行退出 1，对比产出 REL-01、REL-02、REL-03 三条新增失败。远端 CI 的实际运行状态以对应 PR 的检查记录为准，两者分别记录。
