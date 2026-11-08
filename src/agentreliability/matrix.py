@@ -29,6 +29,8 @@ STATE_TIMEOUT = "matrix_timeout"
 STATE_UPSTREAM_FAILURE = "matrix_upstream_failure"
 STATE_MISSING_ARTIFACTS = "matrix_missing_artifacts"
 STATE_PARSE_FAILURE = "matrix_parse_failure"
+STATE_REAL_ENV_UNAVAILABLE = "matrix_real_env_unavailable"
+STATE_REAL_RESULT_INVALID = "matrix_real_result_invalid"
 
 
 def load_spec(path: Path | str | None = None) -> tuple[dict[str, Any], Path]:
@@ -45,6 +47,18 @@ def load_spec(path: Path | str | None = None) -> tuple[dict[str, Any], Path]:
     return spec, spec_path
 
 
+def model_prefix(spec: dict[str, Any], model: dict[str, Any]) -> str:
+    """按清单元数据解析每个模型槽独立的环境变量前缀。"""
+    requirement = (spec.get("real_model_requirements") or {}).get(model["id"]) or []
+    if requirement:
+        first = str(requirement[0])
+        for suffix in ("_API_KEY", "_MODEL", "_BASE_URL"):
+            if first.endswith(suffix):
+                return first[: -len(suffix)]
+        return first
+    return "PAWBENCH_MODEL_" + model["id"].split("-")[-1].upper()
+
+
 def real_model_config(
     spec: dict[str, Any], environ: dict[str, str] | None = None
 ) -> dict[str, Any]:
@@ -52,18 +66,90 @@ def real_model_config(
     missing: list[str] = []
     resolved = []
     for model in spec["models"]:
-        prefix = "PAWBENCH_MODEL_" + model["id"].split("-")[-1].upper()
+        prefix = model_prefix(spec, model)
         keys = [f"{prefix}_API_KEY", f"{prefix}_MODEL", f"{prefix}_BASE_URL"]
         absent = [key for key in keys if not environ.get(key)]
         missing.extend(absent)
         resolved.append(
             {
                 "id": model["id"],
+                "prefix": prefix,
+                "model": environ.get(f"{prefix}_MODEL") or None,
+                "base_url": environ.get(f"{prefix}_BASE_URL") or None,
                 "model_configured": bool(environ.get(f"{prefix}_MODEL")),
                 "base_url_configured": bool(environ.get(f"{prefix}_BASE_URL")),
             }
         )
     return {"configured": not missing, "missing": missing, "models": resolved}
+
+
+def _basic_counts(trials: list[dict[str, Any]]) -> dict[str, Any]:
+    judgeable = [
+        trial
+        for trial in trials
+        if (trial.get("result") or {}).get("root_cause_correct") is not None
+    ]
+    correct = sum(
+        bool((trial.get("result") or {}).get("root_cause_correct"))
+        for trial in judgeable
+    )
+    return {
+        "trials": len(trials),
+        "workflow_completed": sum(trial["status"] == PASS for trial in trials),
+        "judgeable": len(judgeable),
+        "root_cause_correct": correct,
+        "root_cause_incorrect": len(judgeable) - correct,
+        "error": sum(trial["status"] != PASS for trial in trials),
+    }
+
+
+def _diagnosis_trace(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for trial in trials:
+        result = trial.get("result") or {}
+        if result.get("root_cause_correct") is None:
+            continue
+        expected = str(result.get("expected_category") or "")
+        predicted = str(result.get("predicted_category") or "")
+        model_id = trial.get("model_id")
+        key = (str(model_id or ""), expected, predicted)
+        bucket = buckets.setdefault(
+            key,
+            {
+                "expected_category": expected,
+                "predicted_category": predicted,
+                "count": 0,
+                "root_cause_correct": 0,
+                "fault_category_correct": 0,
+                "category_alias_covered": bool(
+                    result.get("category_alias_covered")
+                ),
+                "model_id": model_id,
+                "model_backend": trial.get("model_backend"),
+            },
+        )
+        bucket["count"] += 1
+        bucket["root_cause_correct"] += bool(result.get("root_cause_correct"))
+        bucket["fault_category_correct"] += bool(
+            result.get("fault_category_correct")
+        )
+    trace: list[dict[str, Any]] = []
+    for bucket in buckets.values():
+        bucket["incorrect"] = bucket["count"] - bucket["root_cause_correct"]
+        if bucket["incorrect"] == 0:
+            bucket["source"] = "matches_ground_truth"
+        elif not bucket["predicted_category"]:
+            bucket["source"] = "model_output_missing"
+        elif (
+            bucket["category_alias_covered"]
+            and bucket["fault_category_correct"] == 0
+        ):
+            bucket["source"] = "scoring_mapping"
+        else:
+            bucket["source"] = "model_output"
+        trace.append(bucket)
+    trace.sort(key=lambda item: (-item["count"], item["predicted_category"]))
+    return trace
 
 
 def summarize(trials: list[dict[str, Any]]) -> dict[str, Any]:
@@ -78,43 +164,173 @@ def summarize(trials: list[dict[str, Any]]) -> dict[str, Any]:
                 "trials": 0,
                 "pass": 0,
                 "error": 0,
+                "judgeable": 0,
                 "root_cause_correct": 0,
+                "root_cause_incorrect": 0,
                 "tool_selection_sum": 0.0,
                 "duration_sum": 0.0,
             },
         )
+        result = trial.get("result") or {}
         group["trials"] += 1
         group["pass"] += trial["status"] == PASS
         group["error"] += trial["status"] != PASS
-        group["root_cause_correct"] += bool(trial["result"].get("root_cause_correct"))
-        group["tool_selection_sum"] += trial["result"].get("tool_selection_score") or 0.0
+        if result.get("root_cause_correct") is not None:
+            group["judgeable"] += 1
+            group["root_cause_correct"] += bool(result.get("root_cause_correct"))
+            group["root_cause_incorrect"] += not bool(
+                result.get("root_cause_correct")
+            )
+        group["tool_selection_sum"] += result.get("tool_selection_score") or 0.0
         group["duration_sum"] += trial.get("duration_seconds") or 0.0
     for group in groups.values():
-        count = group["trials"] or 1
-        group["root_cause_accuracy"] = round(group["root_cause_correct"] / count, 4)
-        group["avg_tool_selection_score"] = round(group["tool_selection_sum"] / count, 4)
-        group["avg_duration_seconds"] = round(group["duration_sum"] / count, 3)
+        judgeable = group["judgeable"] or 1
+        group["root_cause_accuracy"] = round(
+            group["root_cause_correct"] / judgeable, 4
+        )
+        group["avg_tool_selection_score"] = round(
+            group["tool_selection_sum"] / (group["trials"] or 1), 4
+        )
+        group["avg_duration_seconds"] = round(
+            group["duration_sum"] / (group["trials"] or 1), 3
+        )
         group.pop("tool_selection_sum")
         group.pop("duration_sum")
     by_scenario: dict[str, dict[str, Any]] = {}
     for trial in trials:
         bucket = by_scenario.setdefault(
-            trial["scenario"], {"trials": 0, "pass": 0, "root_cause_correct": 0}
+            trial["scenario"],
+            {
+                "trials": 0,
+                "pass": 0,
+                "judgeable": 0,
+                "root_cause_correct": 0,
+                "root_cause_incorrect": 0,
+            },
         )
+        result = trial.get("result") or {}
         bucket["trials"] += 1
         bucket["pass"] += trial["status"] == PASS
-        bucket["root_cause_correct"] += bool(trial["result"].get("root_cause_correct"))
+        if result.get("root_cause_correct") is not None:
+            bucket["judgeable"] += 1
+            bucket["root_cause_correct"] += bool(result.get("root_cause_correct"))
+            bucket["root_cause_incorrect"] += not bool(
+                result.get("root_cause_correct")
+            )
     for bucket in by_scenario.values():
         bucket["root_cause_accuracy"] = round(
-            bucket["root_cause_correct"] / (bucket["trials"] or 1), 4
+            bucket["root_cause_correct"] / (bucket["judgeable"] or 1), 4
         )
+    totals = _basic_counts(trials)
+    trace = _diagnosis_trace(trials)
+    by_source: dict[str, int] = {}
+    for item in trace:
+        if item["incorrect"] <= 0:
+            continue
+        by_source[item["source"]] = by_source.get(item["source"], 0) + item["incorrect"]
     return {
-        "trials": len(trials),
-        "pass": sum(trial["status"] == PASS for trial in trials),
-        "error": sum(trial["status"] != PASS for trial in trials),
+        **totals,
+        "pass": totals["workflow_completed"],
         "groups": list(groups.values()),
         "by_scenario": by_scenario,
+        "diagnosis_trace": trace,
+        "root_cause_discrepancy": {
+            "incorrect": totals["root_cause_incorrect"],
+            "by_source": by_source,
+        },
     }
+
+
+def reference_orders_api(environ: dict[str, str]) -> str:
+    return (
+        environ.get("PAWBENCH_REFERENCE_ORDERS_API_URL")
+        or environ.get("REFERENCE_ORDERS_API_URL")
+        or "http://127.0.0.1:8001"
+    )
+
+
+def _default_reference_probe(url: str, timeout: float) -> tuple[bool, str]:
+    import urllib.error
+    import urllib.request
+
+    try:
+        request = urllib.request.Request(url.rstrip("/") + "/orders")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return int(response.status) in {200, 500, 504}, f"HTTP {response.status}"
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return False, f"{type(exc).__name__}: {str(exc)[:200]}"
+
+
+def validate_real_result(
+    spec: dict[str, Any],
+    config: dict[str, Any],
+    trials: list[dict[str, Any]],
+    payload: dict[str, Any],
+) -> list[str]:
+    """真实结果校验：执行来源、模型标识与实际 provider 元数据必须一致。"""
+    issues: list[str] = []
+    execution = payload.get("execution") or {}
+    if execution.get("mode") != "model":
+        issues.append(f"结果文件执行模式不是 model：{execution.get('mode')}")
+    if execution.get("tier") != "real_llm_investigation":
+        issues.append(f"结果文件执行层级不是 real_llm_investigation：{execution.get('tier')}")
+    slot_models = {item["id"]: item.get("model") for item in config.get("models", [])}
+    if not slot_models:
+        issues.append("缺少模型槽配置")
+    for index, trial in enumerate(trials, start=1):
+        model_id = trial.get("model_id")
+        declared = slot_models.get(model_id)
+        label = f"试验 {index}（{model_id} / {trial.get('strategy')} / {trial.get('scenario')}）"
+        if declared is None:
+            issues.append(f"{label} 使用了未知模型槽")
+            continue
+        if trial.get("model_backend") != "real-llm":
+            issues.append(f"{label} 执行来源为 {trial.get('model_backend')}，不是真实模型")
+        trial_execution = trial.get("execution") or {}
+        if trial_execution.get("tier") != "real_llm_investigation":
+            issues.append(f"{label} 执行层级为 {trial_execution.get('tier')}")
+        if not trial_execution.get("llm_enabled"):
+            issues.append(f"{label} 未启用真实模型")
+        if trial_execution.get("tool_backend") != "mcp":
+            issues.append(f"{label} 工具后端为 {trial_execution.get('tool_backend')}，不是 mcp")
+        if trial.get("model_identifier") != declared:
+            issues.append(
+                f"{label} 模型标识 {trial.get('model_identifier')} 与槽配置 {declared} 不一致"
+            )
+        provider_model = trial.get("provider_model")
+        actual = provider_model.get("model") if isinstance(provider_model, dict) else None
+        if trial.get("status") == PASS and not actual:
+            issues.append(f"{label} 缺少真实 provider 模型元数据")
+        elif actual and actual != declared:
+            issues.append(f"{label} 实际 provider 模型 {actual} 与槽配置 {declared} 不一致")
+    return issues
+
+
+def real_result_verdict(
+    trials: list[dict[str, Any]],
+    payload: dict[str, Any],
+    issues: list[str],
+) -> tuple[str, str | None, str | None]:
+    """真实模式的唯一放行路径：无试验 → NOT_RUN；校验不通过 → ERROR。"""
+    if not trials:
+        return (
+            NOT_RUN,
+            STATE_REAL_ENV_UNAVAILABLE,
+            "真实执行器未产出任何试验",
+        )
+    if payload.get("status") != PASS:
+        return (
+            ERROR,
+            STATE_UPSTREAM_FAILURE,
+            "真实执行器未完成计划试验",
+        )
+    if issues:
+        return (
+            ERROR,
+            STATE_REAL_RESULT_INVALID,
+            "真实结果校验失败：" + "；".join(issues[:5]),
+        )
+    return PASS, None, None
 
 
 def _run_dir(base: Path, now: datetime, run_id: str) -> Path:
@@ -140,6 +356,7 @@ def run_matrix(
     incidentpilot_dir: Path | str | None = None,
     timeout: float = 1200.0,
     runner=subprocess.run,
+    reference_probe=None,
     environ: dict[str, str] | None = None,
     now: datetime | None = None,
     run_id: str | None = None,
@@ -226,6 +443,33 @@ def run_matrix(
             manifest["error"] = "缺少两个模型配置：" + "、".join(config["missing"])
             manifest["real_matrix"]["status"] = NOT_RUN
             return _finish(manifest, run_dir, [], root)
+        url = reference_orders_api(environ)
+        probe = reference_probe or _default_reference_probe
+        try:
+            reachable, detail = probe(url, 5.0)
+        except Exception as exc:  # noqa: BLE001 - 环境探测失败即视为不可用
+            reachable, detail = False, f"{type(exc).__name__}: {str(exc)[:200]}"
+        server = root / "ops_mcp" / "ops_readonly" / "server.py"
+        manifest["real_matrix"]["reference_orders_api"] = {
+            "url": url,
+            "reachable": reachable,
+            "detail": detail,
+        }
+        manifest["real_matrix"]["mcp_server_present"] = server.exists()
+        if not reachable or not server.exists():
+            reasons = []
+            if not reachable:
+                reasons.append(f"reference orders API 不可达（{url}）：{detail}")
+            if not server.exists():
+                reasons.append("IncidentPilot 只读 MCP 服务缺失")
+            manifest["status"] = NOT_RUN
+            manifest["state"] = STATE_REAL_ENV_UNAVAILABLE
+            manifest["error"] = "；".join(reasons)
+            manifest["real_matrix"]["status"] = NOT_RUN
+            manifest["notes"].append(
+                "真实矩阵需要可用的 reference orders API 与只读 MCP 服务；未生成任何真实结论"
+            )
+            return _finish(manifest, run_dir, [], root)
     else:
         manifest["notes"].append(
             "离线矩阵使用 IncidentPilot 的脚本化模型与合成工具，模型轴为两个占位配置，"
@@ -244,6 +488,7 @@ def run_matrix(
         return _finish(manifest, run_dir, [], root)
     script = Path(__file__).resolve().parent / "_incidentpilot_matrix.py"
     child_env = dict(os.environ)
+    child_env.update(environ)
     if mode == "offline":
         for key in (
             "LLM_API_KEY",
@@ -254,7 +499,14 @@ def run_matrix(
             child_env.pop(key, None)
     child_env["PYTHONPATH"] = str(root / "src")
     child_env["GITHUB_INTEGRATION_ENABLED"] = "false"
-    command_list = [str(python), str(script), str(root), str(spec_file), str(output_path)]
+    command_list = [
+        str(python),
+        str(script),
+        str(root),
+        str(spec_file),
+        str(output_path),
+        mode,
+    ]
     try:
         completed = runner(
             command_list,
@@ -300,14 +552,27 @@ def run_matrix(
     manifest["errors"] = errors
     manifest["summary"] = summarize(trials)
     manifest["summary"]["expected_trials"] = expected
-    if payload.get("status") != PASS or len(trials) != expected:
+    if mode == "model":
+        issues = validate_real_result(spec, config, trials, payload)
+        if len(trials) != expected:
+            issues.append(f"试验数量不符：计划 {expected}，实际 {len(trials)}")
+        manifest["real_matrix"]["validation"] = {"ok": not issues, "issues": issues}
+        status, state, error = real_result_verdict(trials, payload, issues)
+        manifest["status"] = status
+        manifest["state"] = state
+        if error:
+            if not trials and errors:
+                error += "：" + "；".join(
+                    str(item.get("error") or item) for item in errors[:3]
+                )
+            manifest["error"] = error
+        manifest["real_matrix"]["status"] = status
+    elif payload.get("status") != PASS or len(trials) != expected:
         manifest["status"] = ERROR
         manifest["state"] = STATE_UPSTREAM_FAILURE
         manifest["error"] = f"计划 {expected} 次，实际完成 {len(trials)} 次"
     else:
         manifest["status"] = PASS
-        if mode == "model":
-            manifest["real_matrix"]["status"] = PASS
     return _finish(manifest, run_dir, trials, root)
 
 
@@ -346,7 +611,9 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
     cards = [
         ("试验", summary.get("trials", 0)),
         ("计划", summary.get("expected_trials", 0)),
-        ("通过", summary.get("pass", 0)),
+        ("流程完成", summary.get("workflow_completed", 0)),
+        ("可判定样本", summary.get("judgeable", 0)),
+        ("根因正确", summary.get("root_cause_correct", 0)),
         ("错误", summary.get("error", 0)),
     ]
     card_html = "".join(
@@ -358,6 +625,10 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
         f"<td>{_e(item['model_id'])}</td>"
         f"<td>{_e(item['strategy'])}</td>"
         f"<td>{_e(item['trials'])}</td>"
+        f"<td>{_e(item['workflow_completed'] if 'workflow_completed' in item else item['pass'])}</td>"
+        f"<td>{_e(item.get('judgeable', 0))}</td>"
+        f"<td>{_e(item.get('root_cause_correct', 0))}</td>"
+        f"<td>{_e(item.get('root_cause_incorrect', 0))}</td>"
         f"<td>{_e(item['root_cause_accuracy'])}</td>"
         f"<td>{_e(item['avg_tool_selection_score'])}</td>"
         f"<td>{_e(item['avg_duration_seconds'])}</td>"
@@ -373,11 +644,38 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
         f"<td>{_badge(item.get('status'))}</td>"
         f"<td>{_e(item.get('final_status'))}</td>"
         f"<td>{_e((item.get('result') or {}).get('root_cause_correct'))}</td>"
+        f"<td>{_e((item.get('result') or {}).get('expected_category') or '-')}</td>"
+        f"<td>{_e((item.get('result') or {}).get('predicted_category') or '-')}</td>"
         f"<td>{_e((item.get('result') or {}).get('tool_selection_score'))}</td>"
         f"<td>{_e(item.get('duration_seconds'))}</td>"
         f"<td>{_e((item.get('usage') or {}).get('tokens'))}</td>"
         "</tr>"
         for item in trials
+    )
+    trace_rows = "".join(
+        "<tr>"
+        f"<td>{_e(item.get('model_id') or '')}</td>"
+        f"<td>{_e(item.get('expected_category') or '-')}</td>"
+        f"<td>{_e(item.get('predicted_category') or '-')}</td>"
+        f"<td>{_e(item.get('count'))}</td>"
+        f"<td>{_e(item.get('root_cause_correct'))}</td>"
+        f"<td>{_e(item.get('incorrect'))}</td>"
+        f"<td>{_e(item.get('category_alias_covered'))}</td>"
+        f"<td>{_e(item.get('source'))}</td>"
+        "</tr>"
+        for item in summary.get("diagnosis_trace", [])
+    )
+    discrepancy = summary.get("root_cause_discrepancy") or {}
+    scenario_rows = "".join(
+        "<tr>"
+        f"<td>{_e(name)}</td>"
+        f"<td>{_e(item.get('trials'))}</td>"
+        f"<td>{_e(item.get('judgeable', 0))}</td>"
+        f"<td>{_e(item.get('root_cause_correct', 0))}</td>"
+        f"<td>{_e(item.get('root_cause_incorrect', 0))}</td>"
+        f"<td>{_e(item.get('root_cause_accuracy'))}</td>"
+        "</tr>"
+        for name, item in (summary.get("by_scenario") or {}).items()
     )
     error_rows = "".join(
         "<tr>"
@@ -401,15 +699,22 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
 <div>场景源码：{_e(manifest['target'].get('repository'))} @ {_e(manifest['target'].get('commit'))} ｜ 已验证：{_e(manifest['target'].get('commit_verified'))}</div>
 <div>预算：{_e(_json(manifest.get('budget')))}</div>
 <div>真实矩阵：{_badge(manifest['real_matrix'].get('status') or 'NOT_RUN')} {_e(manifest['real_matrix'].get('error') or '待两个授权模型配置')}</div>
+<div>根因差异：{_e(_json(discrepancy))}</div>
 {_e(manifest.get('error') or '')}
 </div>
 <h2>汇总</h2><div class="cards">{card_html}</div>
 <h2>模型 × 策略</h2>
-<table><thead><tr><th>模型</th><th>策略</th><th>试验</th><th>根因准确率</th><th>工具选择</th><th>平均耗时(s)</th></tr></thead>
+<table><thead><tr><th>模型</th><th>策略</th><th>试验</th><th>流程完成</th><th>可判定</th><th>根因正确</th><th>根因错误</th><th>根因准确率</th><th>工具选择</th><th>平均耗时(s)</th></tr></thead>
 <tbody>{group_rows}</tbody></table>
+<h2>按场景</h2>
+<table><thead><tr><th>场景</th><th>试验</th><th>可判定</th><th>根因正确</th><th>根因错误</th><th>根因准确率</th></tr></thead>
+<tbody>{scenario_rows or '<tr><td colspan=6 class="muted">无</td></tr>'}</tbody></table>
+<h2>根因差异追溯</h2>
+<table><thead><tr><th>模型</th><th>预期类别（金标）</th><th>实际类别（模型输出）</th><th>样本</th><th>正确</th><th>错误</th><th>别名覆盖</th><th>差异来源</th></tr></thead>
+<tbody>{trace_rows or '<tr><td colspan=8 class="muted">无</td></tr>'}</tbody></table>
 <h2>逐次试验</h2>
-<table><thead><tr><th>模型</th><th>策略</th><th>场景</th><th>试验</th><th>状态</th><th>最终状态</th><th>根因正确</th><th>工具选择</th><th>耗时(s)</th><th>用量</th></tr></thead>
-<tbody>{trial_rows or '<tr><td colspan=10 class="muted">无</td></tr>'}</tbody></table>
+<table><thead><tr><th>模型</th><th>策略</th><th>场景</th><th>试验</th><th>状态</th><th>最终状态</th><th>根因正确</th><th>预期类别</th><th>实际类别</th><th>工具选择</th><th>耗时(s)</th><th>用量</th></tr></thead>
+<tbody>{trial_rows or '<tr><td colspan=12 class="muted">无</td></tr>'}</tbody></table>
 <h2>失败</h2>
 <table><thead><tr><th>模型</th><th>策略</th><th>场景</th><th>试验</th><th>错误</th></tr></thead>
 <tbody>{error_rows or '<tr><td colspan=5 class="muted">无</td></tr>'}</tbody></table>

@@ -11,7 +11,8 @@ from .oracle import ERROR, FAIL, NOT_RUN, PASS
 
 _CSS = """
 :root { --bg:#f6f7f9; --card:#fff; --ink:#1f2937; --muted:#6b7280;
-  --line:#e5e7eb; --pass:#0f766e; --fail:#b91c1c; --error:#b45309; --notrun:#6b7280; }
+  --line:#e5e7eb; --pass:#0f766e; --fail:#b91c1c; --error:#b45309; --notrun:#6b7280;
+  --review:#7c3aed; }
 body { margin:0; background:var(--bg); color:var(--ink);
   font:14px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
 main { max-width:1180px; margin:0 auto; padding:32px 24px 64px; }
@@ -29,6 +30,7 @@ th { background:#f3f4f6; font-weight:600; } tr:last-child td { border-bottom:0; 
 .badge { display:inline-block; padding:1px 8px; border-radius:999px; color:#fff; font-size:12px; }
 .pass { background:var(--pass); } .fail { background:var(--fail); }
 .error { background:var(--error); } .not_run { background:var(--notrun); }
+.review { background:var(--review); }
 pre { margin:0; padding:12px; background:#f9fafb; border:1px solid var(--line);
   border-radius:8px; overflow:auto; white-space:pre-wrap; word-break:break-word; }
 details { margin:10px 0; background:var(--card); border:1px solid var(--line); border-radius:10px; }
@@ -53,6 +55,7 @@ def _badge(verdict: str) -> str:
         FAIL: "fail",
         ERROR: "error",
         NOT_RUN: "not_run",
+        "REVIEW_REQUIRED": "review",
         "NOT_COMPARABLE": "error",
     }.get(verdict, "not_run")
     return f'<span class="badge {css}">{_e(verdict)}</span>'

@@ -56,18 +56,36 @@ def build_source_zip(sample_dir: Path | str, target: Path) -> dict[str, Any]:
     sample_dir = Path(sample_dir)
     if not sample_dir.is_dir():
         raise AigError(STATE_SAMPLE_INVALID, f"白名单样例目录不存在：{sample_dir.name}")
+    sample_root = sample_dir.resolve()
     included: list[str] = []
     skipped: list[str] = []
+    rejected: list[dict[str, str]] = []
     target.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
         for path in sorted(sample_dir.rglob("*")):
+            if path.is_symlink():
+                # 符号链接可能指向目录外文件，一律拒绝入包。
+                relative = str(path.relative_to(sample_dir))
+                rejected.append({"path": relative, "reason": "symlink"})
+                skipped.append(relative)
+                continue
             if not path.is_file():
                 continue
             relative = path.relative_to(sample_dir)
             if any(part.startswith(".") for part in relative.parts) or path.suffix.lower() not in ALLOWED_SUFFIXES:
                 skipped.append(str(relative))
                 continue
-            archive.write(path, arcname=str(relative))
+            try:
+                real = path.resolve(strict=True)
+            except OSError:
+                rejected.append({"path": str(relative), "reason": "unresolvable"})
+                skipped.append(str(relative))
+                continue
+            if not real.is_relative_to(sample_root):
+                rejected.append({"path": str(relative), "reason": "outside_root"})
+                skipped.append(str(relative))
+                continue
+            archive.write(real, arcname=str(relative))
             included.append(str(relative))
     if not included:
         raise AigError(STATE_SAMPLE_INVALID, "白名单样例没有可上传的源码文件")
@@ -77,6 +95,7 @@ def build_source_zip(sample_dir: Path | str, target: Path) -> dict[str, Any]:
         "sha256": sha256_file(target),
         "files": included,
         "skipped_files": skipped,
+        "rejected_files": rejected,
         "allowed_suffixes": sorted(ALLOWED_SUFFIXES),
     }
 

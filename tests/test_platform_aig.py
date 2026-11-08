@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import io
 import json
 import urllib.error
+import zipfile
 from pathlib import Path
 
 from agentreliability.aig import (
@@ -105,6 +107,84 @@ def test_sample_zip_is_whitelist_only(tmp_path):
     assert ".env" in report["skipped_files"]
     assert "key.pem" in report["skipped_files"]
     assert (tmp_path / "out.zip").exists()
+
+
+def _sample_with_external_symlink(tmp_path: Path, marker: str = "OUTSIDE_SECRET") -> tuple[Path, Path]:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.py"
+    secret.write_text(f"{marker} = 1\n", encoding="utf-8")
+    sample_dir = tmp_path / "sample"
+    sample_dir.mkdir()
+    (sample_dir / "server.py").write_text("print('safe')\n", encoding="utf-8")
+    (sample_dir / "linked.py").symlink_to(secret)
+    return sample_dir, secret
+
+
+def _zip_from_upload_body(body: bytes) -> zipfile.ZipFile:
+    start = body.index(b"\r\n\r\n") + 4
+    end = body.rindex(b"\r\n--")
+    return zipfile.ZipFile(io.BytesIO(body[start:end]))
+
+
+def test_symlink_outside_sample_is_rejected_from_zip(tmp_path):
+    sample_dir, secret = _sample_with_external_symlink(tmp_path)
+    report = build_source_zip(sample_dir, tmp_path / "out.zip")
+
+    assert report["files"] == ["server.py"]
+    assert {"path": "linked.py", "reason": "symlink"} in report["rejected_files"]
+    assert "linked.py" in report["skipped_files"]
+    with zipfile.ZipFile(tmp_path / "out.zip") as archive:
+        assert archive.namelist() == ["server.py"]
+        assert b"OUTSIDE_SECRET" not in b"".join(
+            archive.read(name) for name in archive.namelist()
+        )
+    assert secret.read_text(encoding="utf-8").startswith("OUTSIDE_SECRET")
+
+
+def test_upload_never_receives_outside_content(tmp_path):
+    sample_dir, _ = _sample_with_external_symlink(tmp_path)
+    captured: dict[str, bytes] = {}
+    base = _success_transport()
+
+    def transport(method, url, body, headers, timeout):
+        if "/upload" in url:
+            captured["body"] = body
+        return base(method, url, body, headers, timeout)
+
+    manifest, _ = run_aig_scan(
+        out=tmp_path / "artifacts",
+        base_url="http://aig.test",
+        timeout=1.0,
+        poll_interval=0.0,
+        max_poll_seconds=1.0,
+        max_poll_attempts=3,
+        sample_dir=sample_dir,
+        transport=transport,
+        environ={},
+    )
+
+    assert manifest["status"] == "PASS"
+    assert manifest["sample"]["files"] == ["server.py"]
+    assert {"path": "linked.py", "reason": "symlink"} in manifest["sample"]["rejected_files"]
+    with _zip_from_upload_body(captured["body"]) as archive:
+        assert archive.namelist() == ["server.py"]
+        assert b"OUTSIDE_SECRET" not in b"".join(
+            archive.read(name) for name in archive.namelist()
+        )
+
+
+def test_relative_symlink_inside_sample_is_still_rejected(tmp_path):
+    sample_dir = tmp_path / "sample"
+    sample_dir.mkdir()
+    (sample_dir / "server.py").write_text("print('safe')\n", encoding="utf-8")
+    (sample_dir / "linked.py").symlink_to(sample_dir / "server.py")
+    report = build_source_zip(sample_dir, tmp_path / "out.zip")
+
+    assert report["files"] == ["server.py"]
+    assert {"path": "linked.py", "reason": "symlink"} in report["rejected_files"]
+    with zipfile.ZipFile(tmp_path / "out.zip") as archive:
+        assert archive.namelist() == ["server.py"]
 
 
 def test_missing_sample_dir_is_error(tmp_path):

@@ -16,6 +16,7 @@ from .report import sha256_file
 from .vibecheck import STATE_SOURCE_MISSING, ScanReport, run_vibecheck_scan
 
 MANIFEST_FORMAT_VERSION = "1.0"
+REVIEW_REQUIRED = "REVIEW_REQUIRED"
 
 SCENARIOS: dict[str, dict[str, Any]] = {
     "orders-slow-query": {
@@ -132,7 +133,82 @@ def _retest_view(retest: dict[str, Any] | None) -> dict[str, Any] | None:
     return view
 
 
-def _summary(subtasks: list[dict[str, Any]]) -> dict[str, Any]:
+def _diagnosis_assessment(investigation: dict[str, Any] | None) -> dict[str, Any]:
+    if not investigation:
+        return {
+            "status": NOT_RUN,
+            "checks": {},
+            "issues": ["调查未执行，无法验证根因与证据"],
+        }
+    verification = investigation.get("verification") or {}
+    root_cause = investigation.get("root_cause") or {}
+    expected_sources = list(verification.get("expected_evidence_sources") or [])
+    covered_sources = list(
+        verification.get("expected_evidence_sources_covered") or []
+    )
+    verified = root_cause.get("verified")
+    if verified is None:
+        verified = verification.get("root_cause_verified")
+    checks = {
+        "diagnosis_present": bool(verification.get("diagnosis_present")),
+        "root_cause_summary": bool(root_cause.get("summary")),
+        "root_cause_verified": bool(verified),
+        "causal_facts_match": bool(verification.get("causal_facts_match")),
+        "evidence_ids": list(verification.get("evidence_ids") or []),
+        "evidence_bound_to_diagnosis": bool(
+            verification.get("evidence_bound_to_diagnosis")
+        ),
+        "evidence_supports_conclusion": bool(
+            verification.get("evidence_supports_conclusion")
+        ),
+        "cited_evidence_sources": list(
+            verification.get("cited_evidence_sources") or []
+        ),
+        "expected_category_match": bool(verification.get("expected_category_match")),
+        "expected_component_match": bool(verification.get("expected_component_match")),
+        "expected_evidence_sources": expected_sources,
+        "covered_evidence_sources": covered_sources,
+    }
+    issues: list[str] = []
+    if not verification:
+        issues.append("缺少金标判定记录（verification），诊断无法验证")
+    else:
+        if not checks["diagnosis_present"] or not checks["root_cause_summary"]:
+            issues.append("未产出可核验的根因诊断")
+        if not checks["root_cause_verified"]:
+            issues.append("根因未经上游验证（verified=False）")
+        if not checks["causal_facts_match"]:
+            issues.append("关键因果事实与金标不一致")
+        if not checks["evidence_ids"]:
+            issues.append("缺少支撑诊断的证据")
+        if not checks["evidence_bound_to_diagnosis"]:
+            issues.append("证据未绑定到诊断结论")
+        if not checks["evidence_supports_conclusion"]:
+            issues.append("实际引用的证据不足以支持结论")
+        if not checks["expected_category_match"]:
+            issues.append("根因类别与金标不一致")
+        if not checks["expected_component_match"]:
+            issues.append("影响组件与金标不一致")
+        if not covered_sources:
+            issues.append("未记录证据源覆盖情况")
+        elif expected_sources and not set(expected_sources).issubset(
+            set(covered_sources)
+        ):
+            missing = sorted(set(expected_sources) - set(covered_sources))
+            issues.append(f"预期证据源未覆盖：{', '.join(missing)}")
+    return {
+        "status": PASS if not issues else REVIEW_REQUIRED,
+        "checks": checks,
+        "issues": issues,
+    }
+
+
+def _summary(
+    subtasks: list[dict[str, Any]],
+    investigation: dict[str, Any] | None = None,
+    retest: dict[str, Any] | None = None,
+    review: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     counts = {
         "total": len(subtasks),
         "pass": sum(item["status"] == PASS for item in subtasks),
@@ -159,27 +235,66 @@ def _summary(subtasks: list[dict[str, Any]]) -> dict[str, Any]:
     )
     required = ("static_scan", "failure_assertion", "investigation", "sandbox_retest")
     present = {item["name"]: item for item in subtasks}
-    executable_ok = all(
-        present.get(name, {}).get("status") == PASS for name in ("static_scan", "investigation", "sandbox_retest")
+    workflow_ok = present.get("investigation", {}).get("status") == PASS
+    retest_ok = present.get("sandbox_retest", {}).get("status") == PASS
+    diagnosis = (
+        _diagnosis_assessment(investigation)
+        if workflow_ok
+        else {
+            "status": NOT_RUN,
+            "checks": {},
+            "issues": ["调查流程未完成，根因与证据未验证"],
+        }
     )
-    if baseline_ok and executable_ok and not blocking and not unexpected_fail:
-        counts["verdict"] = PASS
-    elif blocking:
+    stages = {
+        "workflow": {
+            "status": present.get("investigation", {}).get("status", NOT_RUN),
+            "detail": (
+                "调查流程完成，已产出根因、补丁与审核状态"
+                if workflow_ok
+                else "调查流程未完成"
+            ),
+        },
+        "diagnosis": diagnosis,
+        "patch_retest": {
+            "status": present.get("sandbox_retest", {}).get("status", NOT_RUN),
+            "detail": (
+                "补丁在 Docker 沙箱复测通过"
+                if retest_ok
+                else "补丁复测未通过或未执行"
+            ),
+        },
+        "human_review": {
+            "status": (review or {}).get("status", "NOT_REACHED"),
+            "detail": (review or {}).get("note")
+            or "人工审核状态由上游流程给出",
+        },
+    }
+
+    if blocking:
         counts["verdict"] = ERROR
-    else:
+    elif not baseline_ok or unexpected_fail:
         counts["verdict"] = FAIL
+    elif diagnosis["status"] != PASS:
+        counts["verdict"] = REVIEW_REQUIRED
+    else:
+        counts["verdict"] = PASS
     counts["baseline_expected_failure_matched"] = baseline_ok
     counts["review_status"] = (
-        "PENDING_HUMAN_REVIEW" if baseline_ok and executable_ok else "NOT_REACHED"
+        "PENDING_HUMAN_REVIEW"
+        if baseline_ok and workflow_ok and retest_ok
+        else "NOT_REACHED"
     )
     counts["required_subtasks"] = list(required)
+    counts["stages"] = stages
+    counts["diagnosis_issues"] = diagnosis["issues"]
     return counts
 
 
 def _exit_code(verdict: str) -> int:
     if verdict == PASS:
         return 0
-    if verdict == FAIL:
+    if verdict in {FAIL, REVIEW_REQUIRED}:
         return 1
     return 2
 
@@ -543,7 +658,12 @@ def run_quality(
     fault_case = (
         source_root / scenario["fault_case"] if source_root is not None else None
     )
-    summary = _summary(subtasks)
+    summary = _summary(
+        subtasks,
+        investigation=investigation,
+        retest=retest,
+        review=(investigation or {}).get("review"),
+    )
     manifest: dict[str, Any] = {
         "format_version": MANIFEST_FORMAT_VERSION,
         "manifest_version": MANIFEST_FORMAT_VERSION,
@@ -689,6 +809,58 @@ def render_quality_html(manifest: dict[str, Any], scan: dict[str, Any]) -> str:
         f'<div class="card"><b>{_badge(review.get("status", NOT_RUN))}</b>'
         f'<span>人工审核</span></div>'
     )
+
+    stages = summary.get("stages") or {}
+    stage_labels = (
+        ("workflow", "调查流程完成"),
+        ("diagnosis", "根因与证据验证"),
+        ("patch_retest", "补丁复测"),
+        ("human_review", "人工审核"),
+    )
+    stage_rows = ""
+    for key, label in stage_labels:
+        item = stages.get(key) or {}
+        detail = item.get("detail") or ""
+        if key == "diagnosis":
+            checks = item.get("checks") or {}
+            issues = item.get("issues") or []
+            notes = []
+            if checks:
+                notes.append(
+                    "根因已验证={}，因果事实匹配={}，类别匹配={}，组件匹配={}，"
+                    "证据绑定={}，引用支持结论={}，证据数={}".format(
+                        checks.get("root_cause_verified"),
+                        checks.get("causal_facts_match"),
+                        checks.get("expected_category_match"),
+                        checks.get("expected_component_match"),
+                        checks.get("evidence_bound_to_diagnosis"),
+                        checks.get("evidence_supports_conclusion"),
+                        len(checks.get("evidence_ids") or []),
+                    )
+                )
+            if issues:
+                notes.append("待审核项：" + "；".join(issues))
+            detail = "；".join(notes) or detail
+        stage_rows += (
+            "<tr>"
+            f"<td>{_e(label)}</td>"
+            f"<td>{_badge(item.get('status', NOT_RUN))}</td>"
+            f"<td>{_e(detail)}</td>"
+            "</tr>"
+        )
+    stage_html = (
+        "<h2>四阶段判定</h2><table><thead><tr>"
+        "<th>阶段</th><th>状态</th><th>说明</th>"
+        f"</tr></thead><tbody>{stage_rows}</tbody></table>"
+    )
+    if summary.get("verdict") == REVIEW_REQUIRED:
+        issues_text = "；".join(summary.get("diagnosis_issues") or [])
+        stage_html += (
+            '<div class="meta warn"><div><b>诊断仍需审核</b>：'
+            "根因与金标不一致或证据不足，不能据此判定闭环通过；"
+            "已验证的补丁复测结果单独保留。</div>"
+            f"<div>{_e(issues_text)}</div></div>"
+        )
 
     subtask_rows = "".join(
         "<tr>"
@@ -899,11 +1071,16 @@ def render_quality_html(manifest: dict[str, Any], scan: dict[str, Any]) -> str:
             f'<div>{_e(separate.get("note"))}</div></div>'
         )
 
+    manifest_for_html = dict(manifest)
+    if manifest_for_html.get("command"):
+        manifest_for_html["command"] = "（命令含本机路径，已脱敏；完整命令见 manifest.json）"
+
     body = (
         "<h1>质量闭环运行报告</h1>"
         f'<p class="muted">场景 {_e(scenario.get("id"))} · 运行 ID {_e(manifest.get("run_id"))}</p>'
         f'<div class="cards">{cards_html}</div>'
         f'<h2>运行元数据</h2><div class="meta">{meta}</div>'
+        f"{stage_html}"
         "<h2>子任务</h2><table><thead><tr>"
         "<th>子任务</th><th>状态</th><th>执行方式</th><th>外部运行 ID</th>"
         "<th>发现</th><th>产物</th><th>错误</th>"
@@ -917,7 +1094,7 @@ def render_quality_html(manifest: dict[str, Any], scan: dict[str, Any]) -> str:
         f"{failure_html}{inv_html}{patch_html}{retest_html}{review_html}"
         f"{separate_html}"
         "<h2>运行清单</h2>"
-        f"<details><summary>manifest.json</summary><div><pre>{_json(manifest)}</pre></div></details>"
+        f"<details><summary>manifest.json</summary><div><pre>{_json(manifest_for_html)}</pre></div></details>"
         "<details><summary>scan.json（脱敏字段）</summary><div><pre>"
         f"{_json({key: scan.get(key) for key in ('scanner', 'status', 'state', 'execution_mode', 'tool', 'scope', 'findings', 'raw_artifact')})}"
         "</pre></div></details>"

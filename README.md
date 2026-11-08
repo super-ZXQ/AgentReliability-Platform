@@ -109,6 +109,59 @@ A.I.G 固定在 `76146bf479b2fedb34f7acb7f536aa37b1f8ba74`，流程为上传白�
 - `artifacts/platform/phase-report/report.html`
 - `artifacts/platform/verification.json`
 
+## 发布前验收
+
+发布前验收的可执行项已完成验证，证据统一放在 `artifacts/release-acceptance/`，历史证据保持原样：
+
+- 验收报告：`artifacts/release-acceptance/report.html`
+- 逐项证据：`artifacts/release-acceptance/item1` 至 `item5` 下的 `verification.json`
+- 平台阶段总索引：`artifacts/platform/verification.json`
+
+复跑核心项：
+
+```sh
+uv run --locked pytest -q
+uv run --locked agentreliability run --mode offline --target-dir .targets/commerce --out artifacts/release-acceptance/item1/offline
+uv run --locked agentreliability quality --scenario orders-slow-query --incidentpilot-dir ~/Developer/GitHub/incidentpilot --vibecheck-dir ~/Developer/GitHub/vibecheck-ai --out artifacts/release-acceptance/item2
+uv run --locked agentreliability matrix --mode offline --incidentpilot-dir ~/Developer/GitHub/incidentpilot --out artifacts/release-acceptance/item3
+```
+
+质量闭环现在分四阶段呈现：调查流程完成、根因与证据验证、补丁复测、人工审核。诊断与金标不一致或证据不足时，总判定为 `REVIEW_REQUIRED` 并以退出码 1 结束，已验证的 Docker 补丁复测结果单独保留为 `PASS`；金标只用于判定器，不注入被测 Agent。
+
+真实模型与服务实测需要本机配置：`LLM_*`（电商套件 6 条 × 3 次）、`OPENJUDGE_*` 与人工复核标签（语义评分）、`PAWBENCH_MODEL_A_*`/`PAWBENCH_MODEL_B_*`（真实 2×2 矩阵）、`AIG_BASE_URL`（A.I.G 扫描）。缺项与复测命令见验收报告中的待补验清单，未把离线或替身结果写入真实服务结论。
+
+## 发布修复：三类误报边界（2026-11-08）
+
+本轮修复真实矩阵、根因验证与 A.I.G 上传三处误报，证据在新目录 `artifacts/release-fix-20261108/`，历史 `artifacts/release-acceptance/` 原样保留：
+
+1. **真实矩阵**：`matrix --mode model` 只走真实模型执行路径（`tier=real_llm_investigation`、`tool_backend=mcp`），两个模型槽分别读取 `PAWBENCH_MODEL_A_*` / `PAWBENCH_MODEL_B_*`。发布真实结果前逐条校验执行来源、模型标识与 provider 元数据；任一条来自脚本化替身即 `ERROR`（`matrix_real_result_invalid`），真实执行器或 reference API / MCP 环境不可用时返回 `NOT_RUN` 且退出码 2，不再产出 `real-service PASS`。
+2. **根因验证**：判定器核验根因 `verified` 状态、关键因果事实覆盖率，以及根因实际声明的证据是否支持结论；缺引用、引用无关证据、因果事实错误均判 `REVIEW_REQUIRED` 并退出 1。桥接层不再在根因缺引用时用本轮全部证据补齐；Docker 补丁复测结果仍独立记录为 `PASS`。
+3. **A.I.G 上传**：`build_source_zip` 拒绝符号链接，并校验每个入包文件解析后的真实路径位于样例根目录内；目录外内容既不会进入 ZIP，也不会传给上传接口。
+
+离线负例集中在 `tests/test_release_boundaries.py`（无需真实模型凭据与外部服务），已接入 PR 工作流的 `agent-regression` 检查，原有 20 条离线门禁保留。
+
+本轮实际复跑：
+
+```sh
+uv run --locked pytest -q
+uv run --locked agentreliability run --mode offline --target-dir .targets/commerce --out artifacts/release-fix-20261108/item1/offline
+uv run --locked agentreliability quality --scenario orders-slow-query --incidentpilot-dir ~/Developer/GitHub/incidentpilot --vibecheck-dir ~/Developer/GitHub/vibecheck-ai --out artifacts/release-fix-20261108/item2
+uv run --locked agentreliability matrix --mode offline --incidentpilot-dir ~/Developer/GitHub/incidentpilot --out artifacts/release-fix-20261108/item3
+```
+
+结果：pytest 99 通过（退出 0）；离线 20/20 通过（退出 0）；订单闭环总判定 `REVIEW_REQUIRED`（退出 1），根因类别与关键因果事实均与金标不一致，Docker 补丁复测独立为 `PASS`；离线矩阵 16/16 流程完成（金标根因正确 0，差异追溯到脚本化决策输出）；真实矩阵缺配置与占位配置分别返回 `NOT_RUN`（退出 2），均无试验产物。
+
+真实项待补验（本机未配置，未伪造结果）：
+
+| 项目 | 本轮状态 | 复跑命令 |
+| --- | --- | --- |
+| 电商真实模型 6 条 × 3 次 | `NOT_RUN`（缺 `LLM_API_KEY`/`LLM_BASE_URL`/`LLM_MODEL`） | `LLM_API_KEY=... LLM_BASE_URL=... LLM_MODEL=... uv run --locked agentreliability run --mode live --allow-network --repeat 3 --target-dir .targets/commerce --out artifacts/release-fix-20261108/item4/live` |
+| 真实 2×2 矩阵 | `NOT_RUN`（缺 `PAWBENCH_MODEL_A_*`/`PAWBENCH_MODEL_B_*`，或 reference orders API 未启动） | `PAWBENCH_MODEL_A_API_KEY=... PAWBENCH_MODEL_A_MODEL=... PAWBENCH_MODEL_A_BASE_URL=... PAWBENCH_MODEL_B_API_KEY=... PAWBENCH_MODEL_B_MODEL=... PAWBENCH_MODEL_B_BASE_URL=... uv run --locked agentreliability matrix --mode model --incidentpilot-dir ~/Developer/GitHub/incidentpilot --out artifacts/release-fix-20261108/item3/model` |
+| A.I.G 扫描 | `NOT_RUN`（缺 `AIG_BASE_URL`） | `AIG_BASE_URL=http://localhost:8088 uv run --locked agentreliability aig --out artifacts/release-fix-20261108/item5/aig` |
+| 语义评分人工复核标签 | `NOT_RUN` | 见 `docs/DEVELOPMENT_PROMPT.md` 的待补验清单 |
+
+发布候选报告：`artifacts/release-fix-20261108/report.html`；脱敏证据包：`artifacts/release-fix-20261108/evidence-bundle/`（自包含相对链接，复制到新目录后仍可打开）。
+
 ## 对比与红绿复现
 
 先用默认行为跑健康基线，再用演示变体关闭 SQL 失败后的重试，最后恢复默认行为重跑：
@@ -129,7 +182,7 @@ uv run --locked agentreliability run --mode offline --target-dir .targets/commer
 
 ## GitHub 合并检查
 
-`.github/workflows/agent-regression.yml` 定义 `agent-regression` 检查，在 PR 到 `main` 时执行。检查检出完整历史，从 PR 基准提交读取 `target.lock.json`，再用候选工作树中的锁分别准备目标 checkout，运行同一套 20 条用例并执行 `compare`。缺失基准锁、候选未覆盖 20 个唯一用例 ID、断言失败或环境错误都会让检查失败；失败时仍上传报告、轨迹、日志和 `ci-summary.json`。
+`.github/workflows/agent-regression.yml` 定义 `agent-regression` 检查，在 PR 到 `main` 时执行。检查先运行 `tests/test_release_boundaries.py` 的三类离线负例（不需要模型凭据或外部服务），再检出完整历史，从 PR 基准提交读取 `target.lock.json`，用候选工作树中的锁分别准备目标 checkout，运行同一套 20 条用例并执行 `compare`。缺失基准锁、候选未覆盖 20 个唯一用例 ID、断言失败或环境错误都会让检查失败；失败时仍上传报告、轨迹、日志和 `ci-summary.json`。
 
 将检查设为分支保护规则：在仓库 Settings → Branches 中为 `main` 启用规则，并要求 `agent-regression` 通过后才能合并。
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,42 @@ LATENCY_THRESHOLD_MS = 250.0
 
 def _tail(text: str, limit: int = 2000) -> str:
     return (text or "")[-limit:]
+
+
+def _causal_facts_coverage(
+    ground_truth, root_cause: dict
+) -> tuple[bool, list[dict]]:
+    """逐条核验关键因果事实：至少一条事实的实质词覆盖达到一半。
+
+    上游结构化评分对事实只做“任一关键词命中”的宽松判断，容易放过
+    只重复 orders/latency 等泛词但机制错误的解释。判定器在此加严。
+    """
+    facts = [str(item).lower() for item in (ground_truth.get("causal_facts") or [])]
+    if not facts:
+        return False, []
+    text = " ".join(
+        [
+            str(root_cause.get("summary") or ""),
+            *[str(item) for item in root_cause.get("causal_facts") or []],
+        ]
+    ).lower()
+    covered: list[dict] = []
+    for fact in facts:
+        tokens = {token for token in re.split(r"[^a-z0-9_]+", fact) if len(token) > 3}
+        if not tokens:
+            continue
+        hits = sorted(token for token in tokens if token in text)
+        ratio = len(hits) / len(tokens)
+        covered.append(
+            {
+                "fact": fact,
+                "tokens": sorted(tokens),
+                "hits": hits,
+                "ratio": round(ratio, 4),
+            }
+        )
+    supported = any(item["ratio"] >= 0.5 for item in covered)
+    return supported, covered
 
 
 def _iso(value) -> str | None:
@@ -186,32 +223,59 @@ async def run_workflow(root: Path, reference_dir: Path, tmp: Path, case) -> dict
         result = run_obj.result or {}
         trace_id = run_obj.trace_id
 
+    from incidentpilot.eval.scoring import score_structured_root_cause
+
     root_cause_summary = str(
         (root_cause or {}).get("summary") or state.get("root_cause", {}).get("summary") or ""
     )
-    evidence_ids = (root_cause or {}).get("evidence_ids") or [
-        item.get("evidence_id") for item in state.get("evidence") or []
-    ]
+    # 只采用根因自身声明的引用；缺引用时不得用本轮全部证据补齐。
+    evidence_ids = list((root_cause or {}).get("evidence_ids") or [])
     expected_sources = set(str(item) for item in case.expected_evidence_sources)
     observed_sources = {
         item.tool_name for item in tool_calls if str(item.status).endswith("SUCCEEDED")
     }
+    evidence_dicts = [
+        {
+            "evidence_id": item.evidence_id,
+            "run_id": run_id,
+            "tool_call_id": item.tool_call_id,
+            "hash": item.content_hash,
+            "result": item.result,
+        }
+        for item in evidence
+    ]
+    calls = [
+        {"tool_call_id": item.tool_call_id, "status": item.status, "output": item.output}
+        for item in tool_calls
+    ]
+    structured = score_structured_root_cause(
+        case.ground_truth,
+        root_cause or {},
+        evidence=evidence_dicts,
+        tool_calls=calls,
+        run_id=run_id,
+    )
+    causal_supported, causal_coverage = _causal_facts_coverage(
+        case.ground_truth, root_cause or {}
+    )
+    call_names = {item.tool_call_id: item.tool_name for item in tool_calls}
+    cited = [item for item in evidence if item.evidence_id in set(evidence_ids)]
+    cited_sources = sorted({call_names.get(item.tool_call_id, str(item.source)) for item in cited})
     verification = {
         "diagnosis_present": bool(root_cause_summary),
+        "root_cause_verified": bool((root_cause or {}).get("verified")),
         "diagnosis_fault_category": (root_cause or {}).get("fault_category"),
-        "expected_category_match": (
-            (root_cause or {}).get("fault_category") == case.ground_truth.fault_category
-        ),
-        "expected_component_match": (
-            str((root_cause or {}).get("affected_component") or "") == case.ground_truth.affected_component
-            or "orders-api"
-            in str((root_cause or {}).get("affected_component") or "")
-        ),
+        "expected_category_match": bool(structured["category_ok"]),
+        "expected_component_match": bool(structured["component_ok"]),
+        "causal_facts_match": causal_supported,
+        "causal_facts_coverage": causal_coverage,
         "evidence_ids": evidence_ids,
-        "evidence_bound_to_diagnosis": bool(evidence_ids)
-        and all(
-            any(item.evidence_id == evidence_id for item in evidence)
-            for evidence_id in evidence_ids
+        "evidence_bound_to_diagnosis": bool(structured["evidence_bound"]),
+        "cited_evidence_sources": cited_sources,
+        "evidence_supports_conclusion": bool(
+            cited
+            and len(cited_sources) >= 2
+            and set(cited_sources) & expected_sources
         ),
         "expected_evidence_sources": sorted(expected_sources),
         "observed_evidence_sources": sorted(observed_sources),
@@ -239,6 +303,7 @@ async def run_workflow(root: Path, reference_dir: Path, tmp: Path, case) -> dict
             "summary": root_cause_summary,
             "fault_category": (root_cause or {}).get("fault_category"),
             "affected_component": (root_cause or {}).get("affected_component"),
+            "causal_facts": (root_cause or {}).get("causal_facts") or [],
             "confidence": (root_cause or {}).get("confidence"),
             "verified": (root_cause or {}).get("verified"),
         },

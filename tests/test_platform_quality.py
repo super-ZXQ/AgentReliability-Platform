@@ -47,8 +47,18 @@ def _require_docker() -> None:
 
 
 def _incident_payload(
-    *, baseline_status: str = "FAIL", retest_status: str = "PASS"
+    *,
+    baseline_status: str = "FAIL",
+    retest_status: str = "PASS",
+    category_match: bool = True,
+    component_match: bool = True,
+    evidence_bound: bool = True,
+    evidence_ids: list[str] | None = None,
+    causal_facts_match: bool = True,
+    root_cause_verified: bool = True,
+    evidence_supports: bool = True,
 ) -> dict:
+    ids = ["EVD-1"] if evidence_ids is None else list(evidence_ids)
     baseline = {
         "name": "fault_active_latency",
         "status": baseline_status,
@@ -72,7 +82,9 @@ def _incident_payload(
             "summary": "orders-api degradation is caused by dependency timeout configuration",
             "fault_category": "code_or_database_regression",
             "affected_component": "orders-api",
+            "causal_facts": ["slow database path adds request delay"],
             "confidence": "MEDIUM",
+            "verified": root_cause_verified,
         },
         "hypotheses": [],
         "evidence": [
@@ -113,10 +125,16 @@ def _incident_payload(
         ],
         "verification": {
             "diagnosis_present": True,
-            "evidence_ids": ["EVD-1"],
-            "evidence_bound_to_diagnosis": True,
-            "expected_category_match": False,
-            "expected_component_match": True,
+            "root_cause_verified": root_cause_verified,
+            "causal_facts_match": causal_facts_match,
+            "evidence_ids": ids,
+            "evidence_bound_to_diagnosis": evidence_bound and bool(ids),
+            "cited_evidence_sources": ["read_metrics", "read_source_code"]
+            if evidence_supports
+            else ["read_metrics"],
+            "evidence_supports_conclusion": evidence_supports and bool(ids),
+            "expected_category_match": category_match,
+            "expected_component_match": component_match,
             "expected_evidence_sources_covered": ["read_metrics"],
         },
         "review": {
@@ -307,8 +325,14 @@ def test_quality_manifest_traces_to_real_scan(tmp_path):
         vibecheck_dir=REAL_VIBECHECK,
     )
 
-    assert quality.quality_exit_code(manifest) == 0
-    assert manifest["summary"]["verdict"] == "PASS"
+    assert quality.quality_exit_code(manifest) == 1
+    assert manifest["summary"]["verdict"] == "REVIEW_REQUIRED"
+    stages = manifest["summary"]["stages"]
+    assert stages["workflow"]["status"] == "PASS"
+    assert stages["diagnosis"]["status"] == "REVIEW_REQUIRED"
+    assert stages["patch_retest"]["status"] == "PASS"
+    assert stages["human_review"]["status"] == "PENDING_HUMAN_REVIEW"
+    assert "根因类别与金标不一致" in stages["diagnosis"]["issues"]
     assert manifest["target"]["commit_verified"] is True
     assert manifest["scenario"]["source"]["commit"] == (
         "566639ea876eed171c705ad0c1a0d79276b8584b"
@@ -332,6 +356,8 @@ def test_quality_manifest_traces_to_real_scan(tmp_path):
     html_text = (run_dir / "report.html").read_text(encoding="utf-8")
     assert "VibeCheck-AI" in html_text
     assert "注入的模拟延迟" in html_text
+    assert "四阶段判定" in html_text
+    assert "诊断仍需审核" in html_text
     assert "/Users/" not in html_text
     assert "/var/folders" not in html_text
 
@@ -388,6 +414,135 @@ def test_rerun_creates_new_run_directory(tmp_path, monkeypatch):
     assert first_dir.parent == second_dir.parent
     assert len(list(first_dir.parent.iterdir())) == 2
     assert first["subtasks"][0]["execution_mode"] == "test-double"
+
+
+def test_diagnosis_mismatch_requires_review_but_keeps_patch_result(tmp_path):
+    _require_real_tools()
+    manifest, _ = _run_quality(
+        tmp_path,
+        incidentpilot_dir=REAL_INCIDENTPILOT,
+        vibecheck_dir=REAL_VIBECHECK,
+        scan_runner=_fake_runner(payload=_payload([_synthetic_finding()])),
+        incidentpilot_runner=_incident_runner(
+            _incident_payload(category_match=False)
+        ),
+    )
+
+    summary = manifest["summary"]
+    assert summary["verdict"] == "REVIEW_REQUIRED"
+    assert quality.quality_exit_code(manifest) == 1
+    assert summary["stages"]["workflow"]["status"] == "PASS"
+    assert summary["stages"]["diagnosis"]["status"] == "REVIEW_REQUIRED"
+    assert "根因类别与金标不一致" in summary["stages"]["diagnosis"]["issues"]
+    assert summary["stages"]["patch_retest"]["status"] == "PASS"
+    assert summary["stages"]["human_review"]["status"] == "PENDING_HUMAN_REVIEW"
+    retest = next(
+        item for item in manifest["subtasks"] if item["name"] == "sandbox_retest"
+    )
+    assert retest["status"] == "PASS"
+    assert retest["fault_active"]["status"] == "PASS"
+    assert retest["healthy_regression"]["status"] == "PASS"
+    assert manifest["review"]["status"] == "PENDING_HUMAN_REVIEW"
+
+
+def test_wrong_root_cause_with_matching_category_and_retest_requires_review(tmp_path):
+    """类别匹配 + 补丁复测通过 + 实际根因错误，仍不得判定通过。"""
+    _require_real_tools()
+    manifest, _ = _run_quality(
+        tmp_path,
+        incidentpilot_dir=REAL_INCIDENTPILOT,
+        vibecheck_dir=REAL_VIBECHECK,
+        scan_runner=_fake_runner(payload=_payload([_synthetic_finding()])),
+        incidentpilot_runner=_incident_runner(
+            _incident_payload(
+                category_match=True,
+                component_match=True,
+                causal_facts_match=False,
+            )
+        ),
+    )
+
+    summary = manifest["summary"]
+    assert summary["verdict"] == "REVIEW_REQUIRED"
+    assert quality.quality_exit_code(manifest) == 1
+    assert "关键因果事实与金标不一致" in summary["stages"]["diagnosis"]["issues"]
+    assert summary["stages"]["patch_retest"]["status"] == "PASS"
+    retest = next(
+        item for item in manifest["subtasks"] if item["name"] == "sandbox_retest"
+    )
+    assert retest["status"] == "PASS"
+
+
+def test_missing_root_cause_citations_requires_review(tmp_path):
+    _require_real_tools()
+    manifest, _ = _run_quality(
+        tmp_path,
+        incidentpilot_dir=REAL_INCIDENTPILOT,
+        vibecheck_dir=REAL_VIBECHECK,
+        scan_runner=_fake_runner(payload=_payload([_synthetic_finding()])),
+        incidentpilot_runner=_incident_runner(_incident_payload(evidence_ids=[])),
+    )
+
+    issues = manifest["summary"]["stages"]["diagnosis"]["issues"]
+    assert manifest["summary"]["verdict"] == "REVIEW_REQUIRED"
+    assert quality.quality_exit_code(manifest) == 1
+    assert "缺少支撑诊断的证据" in issues
+    assert "证据未绑定到诊断结论" in issues
+
+
+def test_irrelevant_citations_requires_review(tmp_path):
+    _require_real_tools()
+    manifest, _ = _run_quality(
+        tmp_path,
+        incidentpilot_dir=REAL_INCIDENTPILOT,
+        vibecheck_dir=REAL_VIBECHECK,
+        scan_runner=_fake_runner(payload=_payload([_synthetic_finding()])),
+        incidentpilot_runner=_incident_runner(_incident_payload(evidence_supports=False)),
+    )
+
+    issues = manifest["summary"]["stages"]["diagnosis"]["issues"]
+    assert manifest["summary"]["verdict"] == "REVIEW_REQUIRED"
+    assert quality.quality_exit_code(manifest) == 1
+    assert "实际引用的证据不足以支持结论" in issues
+    assert manifest["summary"]["stages"]["patch_retest"]["status"] == "PASS"
+
+
+def test_unverified_root_cause_requires_review(tmp_path):
+    _require_real_tools()
+    manifest, _ = _run_quality(
+        tmp_path,
+        incidentpilot_dir=REAL_INCIDENTPILOT,
+        vibecheck_dir=REAL_VIBECHECK,
+        scan_runner=_fake_runner(payload=_payload([_synthetic_finding()])),
+        incidentpilot_runner=_incident_runner(
+            _incident_payload(root_cause_verified=False)
+        ),
+    )
+
+    issues = manifest["summary"]["stages"]["diagnosis"]["issues"]
+    assert manifest["summary"]["verdict"] == "REVIEW_REQUIRED"
+    assert quality.quality_exit_code(manifest) == 1
+    assert "根因未经上游验证（verified=False）" in issues
+
+
+def test_diagnosis_and_retest_pass_is_pass(tmp_path):
+    _require_real_tools()
+    manifest, _ = _run_quality(
+        tmp_path,
+        incidentpilot_dir=REAL_INCIDENTPILOT,
+        vibecheck_dir=REAL_VIBECHECK,
+        scan_runner=_fake_runner(payload=_payload([_synthetic_finding()])),
+        incidentpilot_runner=_incident_runner(_incident_payload()),
+    )
+
+    summary = manifest["summary"]
+    assert summary["verdict"] == "PASS"
+    assert quality.quality_exit_code(manifest) == 0
+    assert summary["diagnosis_issues"] == []
+    assert summary["stages"]["workflow"]["status"] == "PASS"
+    assert summary["stages"]["diagnosis"]["status"] == "PASS"
+    assert summary["stages"]["patch_retest"]["status"] == "PASS"
+    assert summary["stages"]["human_review"]["status"] == "PENDING_HUMAN_REVIEW"
 
 
 def test_revision_mismatch_has_explicit_state(tmp_path):
@@ -460,6 +615,7 @@ def test_timeout_is_not_a_pass(tmp_path):
 
 def test_html_escapes_untrusted_fields(tmp_path):
     manifest = _manifest_from("PASS")
+    manifest["command"] = "uv run quality --incidentpilot-dir /Users/alice/checkout"
     scan = {
         "scanner": {"module": "app.scanner.sensitive", "function": "scan_directory"},
         "status": "PASS",
@@ -480,6 +636,7 @@ def test_html_escapes_untrusted_fields(tmp_path):
     assert "<script>alert(1)</script>" not in html_text
     assert "&lt;script&gt;alert(1)&lt;/script&gt;" in html_text
     assert "<img src=x onerror=alert(2)>" not in html_text
+    assert "/Users/alice/checkout" not in html_text
 
 
 def test_source_checkout_unavailable_is_reported(tmp_path):

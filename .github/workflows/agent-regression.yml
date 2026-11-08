@@ -31,6 +31,9 @@ jobs:
       - name: 同步锁定依赖
         run: uv sync --locked
 
+      - name: 运行发布边界负例门禁
+        run: uv run --locked pytest -q tests/test_release_boundaries.py
+
       - name: 运行基线与候选对比门禁
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
