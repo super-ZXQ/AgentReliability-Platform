@@ -85,6 +85,12 @@ def build_parser() -> argparse.ArgumentParser:
     quality_parser.add_argument(
         "--timeout", type=float, default=180.0, help="扫描子进程超时秒数"
     )
+    quality_parser.add_argument(
+        "--investigation-timeout",
+        type=float,
+        default=600.0,
+        help="调查与沙箱复测子进程超时秒数",
+    )
     return parser
 
 
@@ -473,13 +479,17 @@ def _run_quality(args: argparse.Namespace, raw_argv: list[str]) -> int:
             incidentpilot_dir=args.incidentpilot_dir,
             vibecheck_dir=args.vibecheck_dir,
             timeout=args.timeout,
+            investigation_timeout=args.investigation_timeout,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
     for item in manifest["subtasks"]:
         state = f" [{item['state']}]" if item.get("state") else ""
-        print(f"{item['status']} {item['name']}{state}")
+        expected = (
+            "（预期失败）" if item.get("expected_status") == FAIL else ""
+        )
+        print(f"{item['status']} {item['name']}{state}{expected}")
         if item.get("error"):
             print(f"  原因：{item['error']}", file=sys.stderr)
     summary = manifest["summary"]

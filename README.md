@@ -48,24 +48,26 @@ M1 基线用例 DATA-01 仍验证结果为 42 且执行一次；REL-01 仍验证
 
 M2 验收产物位于 `artifacts/m2/`。`.targets/` 与 `artifacts/` 不进入版本控制。
 
-## 平台化质量闭环（进行中）
+## 平台化质量闭环
 
-`quality` 入口把固定故障场景的证据统一到一份运行清单。当前已接入 VibeCheck-AI 静态扫描，后续子任务在同一清单中追加。
+`quality` 入口用同一条固定场景串起静态扫描、故障复现、离线调查、Docker 沙箱补丁复测与人工审核状态。
 
 ```sh
 uv run --locked agentreliability quality --scenario orders-slow-query --out artifacts/platform/orders-slow-query
 ```
 
-每次运行写入新目录 `runs/<UTC 时间>-<运行 ID>/`，包含：
+场景源码固定为 IncidentPilot `566639ea876eed171c705ad0c1a0d79276b8584b` 的 `reference/orders_api`，注入 `fault_002_slow_database_query`（模拟延迟 0.5 秒，非真实故障）。每次运行写入新目录 `runs/<UTC 时间>-<运行 ID>/`：
 
-- `manifest.json`：`run_id`、场景与注入故障、目标仓库与完整 SHA、变体、子任务状态/执行方式/产物/外部运行 ID。
-- `scan.json`：白名单字段（规则 ID、等级、维度、相对路径、行号、上游脱敏片段）与扫描范围。
-- `scan.raw.json`：VibeCheck-AI 独立进程的原始输出，用于追溯。
-- `report.html`：只展示脱敏字段，所有值经 HTML 转义。
+- `manifest.json`：`run_id`、场景与注入故障、目标仓库与完整 SHA、变体、四个子任务的状态/执行方式/产物/外部运行 ID、闭环结论与人工审核状态。
+- `scan.json` / `scan.raw.json`：VibeCheck-AI 真实扫描的白名单字段与原始输出。
+- `failure-assertion.json`：原版本在故障条件下的延迟断言、关联运行 ID 与支持证据 ID。
+- `investigation.json`：IncidentPilot 真实运行 ID、工具调用、证据、诊断、补丁产物与测试结果。
+- `sandbox-retest.json`：Docker 隔离工作区的基线 SHA、补丁摘要、故障条件断言与健康回归的命令和输出。
+- `report.html`：按扫描 → 故障 → 诊断证据 → 补丁 → 复测 → 审核顺序展示，只使用脱敏字段并做 HTML 转义。
 
-扫描器锁定在 `3a0e22c7e49eb317cbecb80c4d7616668938300e`，通过上游后端虚拟环境执行真实 `app.scanner.sensitive.scan_directory`，平台进程不导入上游代码。场景源码锁定在 IncidentPilot `566639ea876eed171c705ad0c1a0d79276b8584b` 的 `reference/orders_api`，与电商 Agent 回归套件分开记录。
+扫描器锁定在 VibeCheck-AI `3a0e22c7e49eb317cbecb80c4d7616668938300e`，通过其后端虚拟环境在独立进程执行真实 `app.scanner.sensitive.scan_directory`。调查由平台拥有的脚本在 IncidentPilot 虚拟环境内调用上游 `run_agent_workflow`，模型与工具为上游脚本化替身（`offline-scripted`）；Docker 复测为真实容器（`real-docker`）。预计根因只用于验证器比对，不注入被测 Agent。
 
-状态约定：真实扫描成功为 `PASS`；提交错配、超时、上游退出失败、缺失产物或响应不可解析均为 `ERROR` 并退出 2；不会把缺失证据记为通过。替换扫描进程的契约测试单独标记为 `test-double`，与真实扫描结果分开。
+闭环结论不是“所有子任务都通过”：`failure_assertion` 必须以 `FAIL` 命中注入故障，随后调查、补丁与两项复测通过，且人工审批保持 `NOT_RUN`，才输出 `PASS` 供人工审核。提交错配、缺失产物、超时、上游失败、未复现故障或 Docker 不可用都不会生成通过状态。
 
 ## 对比与红绿复现
 

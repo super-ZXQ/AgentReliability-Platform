@@ -69,11 +69,13 @@ def resolve_vibecheck_dir(
     environ: dict[str, str] | None = None,
 ) -> Path | None:
     environ = os.environ if environ is None else environ
-    candidates: list[Path] = []
     if explicit:
-        candidates.append(Path(explicit))
+        candidate = Path(explicit)
+        return candidate.resolve() if candidate.is_dir() else None
+    candidates: list[Path] = []
     if environ.get("VIBECHECK_AI_DIR"):
-        candidates.append(Path(environ["VIBECHECK_AI_DIR"]))
+        candidate = Path(environ["VIBECHECK_AI_DIR"])
+        return candidate.resolve() if candidate.is_dir() else None
     for base in (Path.cwd() / ".targets", Path.home() / "Developer" / "GitHub"):
         candidates.append(base / "vibecheck-ai")
         candidates.append(base / "VibeCheck-AI")
@@ -205,7 +207,7 @@ def run_vibecheck_scan(
         str(scan_root),
         str(out_raw),
     ]
-    env = dict(os.environ) if environ is None else dict(environ)
+    env = dict(os.environ)
     env["PYTHONPATH"] = str(backend)
     env["PYTHONIOENCODING"] = "utf-8"
     execution_mode = "real-service" if runner is subprocess.run else "test-double"
