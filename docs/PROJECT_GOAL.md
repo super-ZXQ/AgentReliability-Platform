@@ -1,0 +1,31 @@
+# AgentReliability Platform 项目目标
+
+## 定位
+
+面向工具型 AI Agent 的自动化测试与回归门禁。作品的主要读者是 AI 测试开发岗位的面试官和评审者，他们应当能在几分钟内重跑一个测试，检查失败证据，并看到版本修复后同一断言重新通过。
+
+首个被测对象是电商数据分析 Agent。它的 Text-to-SQL 工作流有可校验的业务结果、工具调用和执行边界，适合覆盖功能、会话、异常恢复和安全四类风险。[电商 Agent](https://github.com/super-ZXQ/ai-commerce-intelligence-platform)
+
+## V1 成功条件
+
+| 能力 | 可验收的证据 |
+| --- | --- |
+| 测试设计 | 20 条离线用例，每条有风险、输入、独立预期和可复现的测试数据 |
+| 自动化执行 | CLI 在目标源码和依赖准备好后，使用真实 Agent 工作流和合成订单库离线执行 |
+| 问题定位 | 失败报告能从用例跳到具体断言和步骤，并看到预期、实际结果及尝试次数 |
+| 版本准入 | CI 对完整离线套件执行门禁。一处已标明的注入回归能触发失败，恢复后同一套件通过 |
+| 真实模型评估 | 同一模型和 Agent 版本上对 6 条冻结用例各运行 3 次，逐条展示结果和波动 |
+| 求职展示 | README 给出一键运行入口、失败证据、CI 记录和实测报告。演示围绕同一个缺陷展开 |
+
+## 首版决策
+
+- 四周交付。第一周先把正常查询和 SQL 执行失败后的纠错跑通。第二周补齐测试矩阵，第三周加入 CI 与版本对比，第四周完成真实模型抽样和展示。
+- 执行与产物采用 Python CLI、结构化文件和静态 HTML。独立模型实验用于观察效果和波动，离线用例作为合并条件。
+- 被测 Agent 来自固定提交。上游仓库作为被测对象，新仓库承载用例、判定器、报告和门禁。
+- V2 优先接入 IncidentPilot 的诊断证据，并用同一源码提交关联 VibeCheck-AI 的静态扫描。语义评审、多模型矩阵和修复服务按各自的验证需求安排。[IncidentPilot](https://github.com/super-ZXQ/IncidentPilot) · [VibeCheck-AI](https://github.com/super-ZXQ/VibeCheck-AI)
+
+## 已核验的起点
+
+固定版本的电商 Agent 已在内存 SQLite 上试跑。正常查询和单次纠错的结果均为 42，漏掉月份上界时 SQL 成功执行但得到 92。这些是设计测试用例时的探路结果。V1 的交付证据来自新仓库的验收命令。[被测 Agent 运行入口](https://github.com/super-ZXQ/ai-commerce-intelligence-platform/blob/5e63127268dd45c4f526635dcc97d51fc5b41de8/agent_core/runtime.py#L642)
+
+接手开发从[开发提示词](DEVELOPMENT_PROMPT.md)开始。

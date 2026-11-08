@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# AgentReliability local targets and artifacts
+.targets/
+artifacts/
