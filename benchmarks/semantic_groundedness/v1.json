@@ -1,0 +1,189 @@
+{
+  "version": "v1",
+  "created_at": "2026-11-08",
+  "split_policy": "calibration and holdout are frozen in this file; no sample may move between splits without a new version",
+  "label_source": "project-authored from IncidentPilot fault_002_slow_database_query evidence bundles; human review pending",
+  "labels_human_reviewed": false,
+  "samples": [
+    {
+      "id": "cal-01",
+      "split": "calibration",
+      "label": "supported",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "metrics: endpoint=/orders p95_latency_ms=1800 request_rate_per_min=42 baseline_p95_ms=420",
+      "diagnosis": "Metrics show the /orders P95 latency at 1800ms while the request rate stayed at 42 per minute, so traffic growth does not explain the delay.",
+      "rationale": "Every claim restates a value present in the observation, and the negative traffic claim matches the observed rate."
+    },
+    {
+      "id": "cal-02",
+      "split": "calibration",
+      "label": "supported",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "logs: 2026-09-16T11:02:14Z level=INFO path=/orders message='database query completed in 512ms'",
+      "diagnosis": "The logs record a /orders database query that took about 512ms.",
+      "rationale": "The latency value and endpoint come directly from the log line."
+    },
+    {
+      "id": "cal-03",
+      "split": "calibration",
+      "label": "supported",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "source: reference/orders_api/app.py line 31: await asyncio.sleep(0.5) inside the /orders handler",
+      "diagnosis": "The /orders handler contains an injected 0.5 second sleep in the source code.",
+      "rationale": "The sleep duration, location and handler are all present in the observation."
+    },
+    {
+      "id": "cal-04",
+      "split": "calibration",
+      "label": "unsupported",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "metrics: endpoint=/orders p95_latency_ms=1800 request_rate_per_min=42 memory_usage_percent=38",
+      "diagnosis": "A memory leak in the worker pool caused the latency spike.",
+      "rationale": "No memory leak or worker pool evidence appears in the observation; memory usage is only 38 percent."
+    },
+    {
+      "id": "cal-05",
+      "split": "calibration",
+      "label": "unsupported",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "logs: path=/orders message='database query completed in 512ms'",
+      "diagnosis": "The deployment pipeline skipped tests, which caused the incident.",
+      "rationale": "The observation contains a slow query log, not any deployment pipeline or test-skip evidence."
+    },
+    {
+      "id": "cal-06",
+      "split": "calibration",
+      "label": "unsupported",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "source: reference/orders_api/app.py line 31: await asyncio.sleep(0.5) inside the /orders handler",
+      "diagnosis": "An attacker exploited CVE-2024-1234 in the database driver.",
+      "rationale": "The source shows a sleep statement; it contains no driver exploit or CVE information."
+    },
+    {
+      "id": "cal-07",
+      "split": "calibration",
+      "label": "borderline",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "metrics: endpoint=/orders p95_latency_ms=1800 request_rate_per_min=42",
+      "diagnosis": "Latency is elevated, and a slow database query is likely the cause.",
+      "rationale": "The elevated latency is supported, but the causal slow-query claim is an inference not present in metrics alone."
+    },
+    {
+      "id": "cal-08",
+      "split": "calibration",
+      "label": "borderline",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "metrics: endpoint=/orders p95_latency_ms=420 request_rate_per_min=42; logs: message='database timeout'",
+      "diagnosis": "The database timeout caused the latency spike, although latency metrics look normal.",
+      "rationale": "A timeout log exists, but the latency spike claim contradicts the observed 420ms value."
+    },
+    {
+      "id": "cal-09",
+      "split": "calibration",
+      "label": "borderline",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "source: reference/orders_api/app.py line 31: await asyncio.sleep(0.5) inside the /orders handler",
+      "diagnosis": "The sleep is probably a performance workaround for a known database bug.",
+      "rationale": "The sleep is observed, but its purpose and the database bug are speculative."
+    },
+    {
+      "id": "cal-10",
+      "split": "calibration",
+      "label": "supported",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "metrics: endpoint=/orders p95_latency_ms=1800; logs: path=/orders message='database query completed in 512ms'",
+      "diagnosis": "Metrics place /orders P95 at 1800ms and logs show a 512ms database query, together indicating that the database path adds delay.",
+      "rationale": "Both numeric claims are observed and the combined inference follows from them."
+    },
+    {
+      "id": "hold-01",
+      "split": "holdout",
+      "label": "supported",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "config: database_timeout_seconds=30 retry_attempts=5; logs: 5 retry messages for /orders",
+      "diagnosis": "The 30 second database timeout and five configured retries match the five retry log messages and explain the added delay.",
+      "rationale": "Timeout, retry count and log count are all present in the observation."
+    },
+    {
+      "id": "hold-02",
+      "split": "holdout",
+      "label": "supported",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "git: commit abc123 removes index idx_orders_customer from migrations/003_indexes.sql",
+      "diagnosis": "The latest commit drops the orders customer index, matching the slower query path.",
+      "rationale": "The commit and removed index are observed; the slower path link is a bounded inference."
+    },
+    {
+      "id": "hold-03",
+      "split": "holdout",
+      "label": "supported",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "metrics: cpu_usage_percent=21 database_connections=8 p95_latency_ms=1800",
+      "diagnosis": "CPU stayed at 21 percent with eight database connections, so CPU saturation is not the cause of the 1800ms latency.",
+      "rationale": "The CPU value and connection count are observed and support the negative claim."
+    },
+    {
+      "id": "hold-04",
+      "split": "holdout",
+      "label": "unsupported",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "metrics: endpoint=/orders p95_latency_ms=1800 request_rate_per_min=42",
+      "diagnosis": "The cache cluster lost 40 percent of its nodes.",
+      "rationale": "No cache cluster or node-loss evidence exists in the metrics observation."
+    },
+    {
+      "id": "hold-05",
+      "split": "holdout",
+      "label": "unsupported",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "logs: path=/orders status=504 message='upstream request timeout'",
+      "diagnosis": "A developer pushed a bad CSS change.",
+      "rationale": "The observation contains a gateway timeout and no CSS or deployment evidence."
+    },
+    {
+      "id": "hold-06",
+      "split": "holdout",
+      "label": "unsupported",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "source: reference/orders_api/app.py line 31: await asyncio.sleep(0.5) inside the /orders handler",
+      "diagnosis": "The orders database contains one hundred million rows.",
+      "rationale": "Row count is fabricated; the only observed fact is a sleep statement."
+    },
+    {
+      "id": "hold-07",
+      "split": "holdout",
+      "label": "borderline",
+      "preferred_label": "supported",
+      "label_source": "project-authored",
+      "observation": "logs: path=/orders message='database query completed in 512ms'",
+      "diagnosis": "The slow query is the primary cause, and network jitter may also contribute.",
+      "rationale": "The slow query is observed, but network jitter is an unsupported additional possibility."
+    },
+    {
+      "id": "hold-08",
+      "split": "holdout",
+      "label": "borderline",
+      "preferred_label": "unsupported",
+      "label_source": "project-authored",
+      "observation": "metrics: endpoint=/orders p95_latency_ms=1800 request_rate_per_min=42",
+      "diagnosis": "A recent configuration change likely caused the latency spike.",
+      "rationale": "Latency is observed, but the configuration-change cause is not present in metrics."
+    }
+  ]
+}

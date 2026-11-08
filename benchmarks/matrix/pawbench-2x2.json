@@ -1,0 +1,34 @@
+{
+  "version": "v1",
+  "reference": {
+    "name": "PawBench",
+    "repository": "https://github.com/agentscope-ai/PawBench",
+    "commit": "0f794a8bb6c27aa9ee4091b2691fa30e4ed9cc8f",
+    "note": "参考其 runner/repetition 结果结构；本矩阵属于本项目实验，不是 PawBench 官方榜单"
+  },
+  "models": [
+    {"id": "model-a", "offline_label": "scripted-fake-a"},
+    {"id": "model-b", "offline_label": "scripted-fake-b"}
+  ],
+  "strategies": ["fixed", "autonomous"],
+  "scenarios": [
+    "fault_002_slow_database_query",
+    "fault_001_n_plus_one_orders"
+  ],
+  "repetitions": 2,
+  "budget": {
+    "max_seconds_per_trial": 600,
+    "max_tool_calls": 8,
+    "runs_per_case": 1,
+    "temperature": 0.0
+  },
+  "judge": {
+    "implementation": "IncidentPilot EvaluationHarness",
+    "tier": "workflow_fake",
+    "note": "固定场景、固定数据、固定判定器与预算；判分来自故障用例的 ground truth"
+  },
+  "real_model_requirements": {
+    "model-a": ["PAWBENCH_MODEL_A_API_KEY", "PAWBENCH_MODEL_A_MODEL", "PAWBENCH_MODEL_A_BASE_URL"],
+    "model-b": ["PAWBENCH_MODEL_B_API_KEY", "PAWBENCH_MODEL_B_MODEL", "PAWBENCH_MODEL_B_BASE_URL"]
+  }
+}
