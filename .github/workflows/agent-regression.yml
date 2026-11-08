@@ -34,7 +34,7 @@ jobs:
       - name: 运行基线与候选对比门禁
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: uv run --locked python scripts/agent_regression.py --base-sha "$BASE_SHA" --repo-root . --out artifacts/ci
+        run: uv run --locked python scripts/agent_regression.py --base-sha "$BASE_SHA" --repo-root . --out artifacts/ci --candidate-demo-fault disable-sql-retry
 
       - name: 上传报告与轨迹
         if: always()
