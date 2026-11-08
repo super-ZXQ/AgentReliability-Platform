@@ -22,7 +22,7 @@
 - 四周交付。第一周先把正常查询和 SQL 执行失败后的纠错跑通。第二周补齐测试矩阵，第三周加入 CI 与版本对比，第四周完成真实模型抽样和展示。
 - 执行与产物采用 Python CLI、结构化文件和静态 HTML。独立模型实验用于观察效果和波动，离线用例作为合并条件。
 - 被测 Agent 来自固定提交。上游仓库作为被测对象，新仓库承载用例、判定器、报告和门禁。
-- V2 优先接入 IncidentPilot 的诊断证据，并用同一源码提交关联 VibeCheck-AI 的静态扫描。语义评审、多模型矩阵和修复服务按各自的验证需求安排。[IncidentPilot](https://github.com/super-ZXQ/IncidentPilot) · [VibeCheck-AI](https://github.com/super-ZXQ/VibeCheck-AI)
+- [平台化大阶段](PLATFORM_BUILDOUT.md)以同一源码提交关联扫描、诊断、沙箱验证与复测，并安排语义评分、模型与 Harness 对照及安全扫描。
 
 ## 已核验的起点
 
