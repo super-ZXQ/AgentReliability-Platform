@@ -39,6 +39,9 @@ def build_report(
     results: list[dict[str, Any]],
     started_at: datetime,
     finished_at: datetime,
+    command: str = "",
+    variant: str | None = None,
+    selection: list[str] | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
     summary = {
@@ -54,6 +57,9 @@ def build_report(
         "oracle_version": ORACLE_VERSION,
         "run_id": run_id,
         "mode": mode,
+        "variant": variant,
+        "selection": selection,
+        "command": command,
         "started_at": started_at.astimezone(timezone.utc).isoformat(),
         "finished_at": finished_at.astimezone(timezone.utc).isoformat(),
         "target": target,

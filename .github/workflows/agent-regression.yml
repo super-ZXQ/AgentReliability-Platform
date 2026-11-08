@@ -1,0 +1,45 @@
+name: agent-regression
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-regression-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  agent-regression:
+    name: agent-regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 检出候选工作树
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          python-version: "3.12"
+
+      - name: 同步锁定依赖
+        run: uv sync --locked
+
+      - name: 运行基线与候选对比门禁
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: uv run --locked python scripts/agent_regression.py --base-sha "$BASE_SHA" --repo-root . --out artifacts/ci
+
+      - name: 上传报告与轨迹
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent-regression-${{ github.event.pull_request.number }}
+          path: artifacts/ci
+          if-no-files-found: warn

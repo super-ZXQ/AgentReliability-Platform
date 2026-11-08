@@ -23,13 +23,25 @@ def build_runtime(
     sql_port: SqlitePort,
     model: ScriptedModel,
     conversations: Any | None = None,
+    demo_fault: str | None = None,
 ):
     runtime_module = import_agent_runtime(target)
     if conversations is None:
         from agent_core.session import MemoryConversationStore
 
         conversations = MemoryConversationStore()
-    AgentRuntime = runtime_module.AgentRuntime
+    runtime_class = runtime_module.AgentRuntime
+    if demo_fault == "disable-sql-retry":
+        # 仅在演示变体中覆盖执行后的分支，失败直接进入结果合成。
+        class DemoFaultRuntime(runtime_class):
+            @staticmethod
+            def _after_execution(state):
+                return "answer"
+
+        runtime_class = DemoFaultRuntime
+    elif demo_fault:
+        raise ValueError(f"未知演示变体：{demo_fault}")
+    AgentRuntime = runtime_class
 
     async def retriever(query: str) -> list[Any]:
         return []

@@ -117,6 +117,7 @@ async def run_case(
     fixture_sql: str,
     trace: TraceCollector,
     trial: int = 1,
+    variant: str | None = None,
 ) -> dict[str, Any]:
     case_id = str(case["case_id"])
     turns = _turns(case)
@@ -160,6 +161,7 @@ async def run_case(
                 sql_port=sql_port,
                 model=model,
                 conversations=conversations,
+                demo_fault=variant,
             )
 
             def on_step(step: dict[str, Any], round_no: int = turn_number) -> None:
@@ -274,7 +276,7 @@ async def run_case(
     return {
         "case_id": case_id,
         "trial": trial,
-        "variant": case.get("variant"),
+        "variant": variant or case.get("variant"),
         "duration_ms": duration_ms,
         "verdict": judged["verdict"],
         "expected": _expected_payload(case),
@@ -290,6 +292,7 @@ async def run_cases(
     target: TargetInfo,
     fixture_sql: str,
     run_id: str,
+    variant: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     trace = TraceCollector(run_id=run_id)
     results = []
@@ -301,6 +304,7 @@ async def run_cases(
                 fixture_sql=fixture_sql,
                 trace=trace,
                 trial=1,
+                variant=variant,
             )
         )
     return results, trace.events
@@ -312,5 +316,14 @@ def run_cases_sync(
     target: TargetInfo,
     fixture_sql: str,
     run_id: str,
+    variant: str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    return asyncio.run(run_cases(cases, target=target, fixture_sql=fixture_sql, run_id=run_id))
+    return asyncio.run(
+        run_cases(
+            cases,
+            target=target,
+            fixture_sql=fixture_sql,
+            run_id=run_id,
+            variant=variant,
+        )
+    )
