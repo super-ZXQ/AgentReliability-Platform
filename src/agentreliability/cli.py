@@ -21,6 +21,7 @@ from .live import (
     select_live_cases,
 )
 from .oracle import ERROR, FAIL, NOT_RUN
+from .quality import quality_exit_code, run_quality
 from .report import build_report, write_artifacts
 from .runner import load_cases, not_run_results, run_cases_sync
 from .target import TargetError, verify_target
@@ -67,6 +68,23 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("baseline", help="基线 report.json")
     compare_parser.add_argument("candidate", help="候选 report.json")
     compare_parser.add_argument("--out", required=True, help="对比产物目录")
+
+    quality_parser = subparsers.add_parser(
+        "quality", help="运行平台化质量闭环场景并生成运行清单"
+    )
+    quality_parser.add_argument("--scenario", required=True, help="闭环场景 ID")
+    quality_parser.add_argument(
+        "--out", required=True, help="产物根目录；每次运行写入新的 runs/<时间>-<ID>"
+    )
+    quality_parser.add_argument(
+        "--incidentpilot-dir", default=None, help="IncidentPilot checkout"
+    )
+    quality_parser.add_argument(
+        "--vibecheck-dir", default=None, help="VibeCheck-AI checkout"
+    )
+    quality_parser.add_argument(
+        "--timeout", type=float, default=180.0, help="扫描子进程超时秒数"
+    )
     return parser
 
 
@@ -446,6 +464,38 @@ def _run_compare(args: argparse.Namespace, raw_argv: list[str]) -> int:
     return 0
 
 
+def _run_quality(args: argparse.Namespace, raw_argv: list[str]) -> int:
+    try:
+        manifest, run_dir = run_quality(
+            scenario_id=args.scenario,
+            out=args.out,
+            command=_command(raw_argv),
+            incidentpilot_dir=args.incidentpilot_dir,
+            vibecheck_dir=args.vibecheck_dir,
+            timeout=args.timeout,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    for item in manifest["subtasks"]:
+        state = f" [{item['state']}]" if item.get("state") else ""
+        print(f"{item['status']} {item['name']}{state}")
+        if item.get("error"):
+            print(f"  原因：{item['error']}", file=sys.stderr)
+    summary = manifest["summary"]
+    print(
+        f"{summary['verdict']} 子任务 {summary['total']}，"
+        f"通过 {summary['pass']}，失败 {summary['fail']}，"
+        f"错误 {summary['error']}，未执行 {summary['not_run']}"
+    )
+    print(f"场景：{manifest['scenario']['id']}（注入的模拟延迟）")
+    print(f"运行目录：{run_dir}")
+    print(f"清单：{run_dir / 'manifest.json'}")
+    print(f"扫描：{run_dir / 'scan.json'}")
+    print(f"HTML：{run_dir / 'report.html'}")
+    return quality_exit_code(manifest)
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -457,6 +507,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run(args, raw_argv)
         if args.command == "compare":
             return _run_compare(args, raw_argv)
+        if args.command == "quality":
+            return _run_quality(args, raw_argv)
         return 2
     except Exception as exc:  # noqa: BLE001 - CLI 必须返回稳定退出码
         print(f"运行失败：{type(exc).__name__}: {exc}", file=sys.stderr)

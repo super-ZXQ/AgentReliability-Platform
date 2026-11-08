@@ -48,6 +48,25 @@ M1 基线用例 DATA-01 仍验证结果为 42 且执行一次；REL-01 仍验证
 
 M2 验收产物位于 `artifacts/m2/`。`.targets/` 与 `artifacts/` 不进入版本控制。
 
+## 平台化质量闭环（进行中）
+
+`quality` 入口把固定故障场景的证据统一到一份运行清单。当前已接入 VibeCheck-AI 静态扫描，后续子任务在同一清单中追加。
+
+```sh
+uv run --locked agentreliability quality --scenario orders-slow-query --out artifacts/platform/orders-slow-query
+```
+
+每次运行写入新目录 `runs/<UTC 时间>-<运行 ID>/`，包含：
+
+- `manifest.json`：`run_id`、场景与注入故障、目标仓库与完整 SHA、变体、子任务状态/执行方式/产物/外部运行 ID。
+- `scan.json`：白名单字段（规则 ID、等级、维度、相对路径、行号、上游脱敏片段）与扫描范围。
+- `scan.raw.json`：VibeCheck-AI 独立进程的原始输出，用于追溯。
+- `report.html`：只展示脱敏字段，所有值经 HTML 转义。
+
+扫描器锁定在 `3a0e22c7e49eb317cbecb80c4d7616668938300e`，通过上游后端虚拟环境执行真实 `app.scanner.sensitive.scan_directory`，平台进程不导入上游代码。场景源码锁定在 IncidentPilot `566639ea876eed171c705ad0c1a0d79276b8584b` 的 `reference/orders_api`，与电商 Agent 回归套件分开记录。
+
+状态约定：真实扫描成功为 `PASS`；提交错配、超时、上游退出失败、缺失产物或响应不可解析均为 `ERROR` 并退出 2；不会把缺失证据记为通过。替换扫描进程的契约测试单独标记为 `test-double`，与真实扫描结果分开。
+
 ## 对比与红绿复现
 
 先用默认行为跑健康基线，再用演示变体关闭 SQL 失败后的重试，最后恢复默认行为重跑：
