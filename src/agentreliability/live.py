@@ -245,14 +245,23 @@ def _normalized(value: Any) -> Any:
     return str(value).strip()
 
 
-def _canonical_row(row: Any) -> tuple[Any, ...]:
-    values = list(row.values()) if isinstance(row, dict) else list(row)
-    return tuple(sorted((_normalized(value) for value in values), key=repr))
-
-
 def _rows_match(expected: list[dict], actual: list[dict], ordered: bool) -> bool:
-    expected_rows = [_canonical_row(row) for row in expected]
-    actual_rows = [_canonical_row(row) for row in actual]
+    if len(expected) != len(actual):
+        return False
+    if not expected:
+        return True
+    columns = tuple(expected[0])
+    expected_rows = [tuple(_normalized(row[column]) for column in columns) for row in expected]
+    actual_rows = []
+    for row in actual:
+        values = []
+        for column in columns:
+            names = ("sales", "sales_amount", "total_sales") if column == "sales" else (column,)
+            matches = [name for name in names if name in row]
+            if len(matches) != 1:
+                return False
+            values.append(_normalized(row[matches[0]]))
+        actual_rows.append(tuple(values))
     if ordered:
         return expected_rows == actual_rows
     return sorted(expected_rows, key=repr) == sorted(actual_rows, key=repr)
@@ -360,10 +369,12 @@ def judge_live_case(case: dict[str, Any], observation: dict[str, Any]) -> dict[s
     else:
         expected_rows = case.get("expected_rows") or []
         actual_rows = observation.get("rows") or []
+        # The order-details question has no sort requirement.
+        ordered = bool(case.get("ordered")) and case_id != "DATA-02"
         assertions.append(
             _assertion(
                 "rows",
-                bool(actual_rows) and _rows_match(expected_rows, actual_rows, bool(case.get("ordered"))),
+                bool(actual_rows) and _rows_match(expected_rows, actual_rows, ordered),
                 expected_rows,
                 actual_rows,
             )
@@ -596,6 +607,7 @@ def build_live_report(
         command=command,
         selection=requested_cases,
     )
+    report["oracle_version"] = "live-result-fields-v2"
     report["live"] = live_metadata(
         repeat=repeat,
         requested_cases=requested_cases,

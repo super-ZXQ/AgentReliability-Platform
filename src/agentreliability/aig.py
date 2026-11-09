@@ -11,6 +11,7 @@ import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from .html_report import _CSS, _badge, _e, _json
@@ -28,6 +29,7 @@ DEFAULT_SAMPLE = (
 ALLOWED_SUFFIXES = {".py", ".md", ".json", ".yaml", ".yml", ".toml", ".txt"}
 
 STATE_INSTANCE_MISSING = "aig_instance_missing"
+STATE_MODEL_CONFIG = "aig_model_config_invalid"
 STATE_UNREACHABLE = "aig_unreachable"
 STATE_TIMEOUT = "aig_poll_timeout"
 STATE_TASK_FAILED = "aig_task_failed"
@@ -100,6 +102,19 @@ def build_source_zip(sample_dir: Path | str, target: Path) -> dict[str, Any]:
     }
 
 
+def _redact_response(value: Any, token: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(token, "[redacted]")
+    if isinstance(value, list):
+        return [_redact_response(item, token) for item in value]
+    if isinstance(value, dict):
+        return {
+            key.replace(token, "[redacted]"): _redact_response(item, token)
+            for key, item in value.items()
+        }
+    return value
+
+
 class AigClient:
     def __init__(
         self,
@@ -110,6 +125,7 @@ class AigClient:
         poll_interval: float = 2.0,
         max_poll_seconds: float = 600.0,
         max_poll_attempts: int = 300,
+        redact_token: str = "",
     ):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
@@ -117,6 +133,7 @@ class AigClient:
         self.poll_interval = poll_interval
         self.max_poll_seconds = max_poll_seconds
         self.max_poll_attempts = max_poll_attempts
+        self.redact_token = redact_token
 
     def _call(self, method: str, path: str, body: bytes | None, headers: dict[str, str]) -> dict:
         try:
@@ -135,6 +152,8 @@ class AigClient:
             raise AigError(STATE_SERVICE_FAILURE, f"A.I.G 返回 HTTP {status}")
         try:
             envelope = json.loads(payload.decode("utf-8"))
+            if self.redact_token:
+                envelope = _redact_response(envelope, self.redact_token)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise AigError(STATE_PARSE_FAILURE, f"A.I.G 响应无法解析：{exc}") from exc
         if not isinstance(envelope, dict) or "status" not in envelope:
@@ -184,14 +203,14 @@ class AigClient:
             attempts += 1
             last = self._call("GET", f"/api/v1/app/taskapi/status/{session_id}", None, {})
             state = last.get("status")
-            if state == "completed":
+            if state in {"completed", "done"}:
                 return {"status": state, "attempts": attempts, "last": last}
-            if state == "failed":
+            if state in {"failed", "error", "terminated"}:
                 raise AigError(
                     STATE_TASK_FAILED,
                     f"A.I.G 扫描任务失败：{last.get('log') or '未提供日志'}",
                 )
-            if state not in {"pending", "running"}:
+            if state not in {"pending", "running", "todo", "doing"}:
                 raise AigError(STATE_PARSE_FAILURE, f"未知任务状态：{state}")
             if time.monotonic() - started >= self.max_poll_seconds:
                 break
@@ -339,6 +358,19 @@ def run_aig_scan(
         manifest["notes"].append("实例就绪后运行：AIG_BASE_URL=http://localhost:8088 uv run --locked agentreliability aig --out <dir>")
         return _finish(manifest, run_dir)
 
+    model = {
+        "model": environ.get("AIG_MODEL", "").strip(),
+        "base_url": environ.get("AIG_MODEL_BASE_URL", "").strip(),
+        "token": environ.get("AIG_MODEL_TOKEN", "").strip(),
+    }
+    if any(model.values()) and (
+        not all(model.values())
+        or urlsplit(base_url).hostname not in {"127.0.0.1", "::1", "localhost"}
+    ):
+        manifest["state"] = STATE_MODEL_CONFIG
+        manifest["error"] = "显式模型需同时配置 AIG_MODEL、AIG_MODEL_BASE_URL、AIG_MODEL_TOKEN，并使用本地 A.I.G 实例"
+        return _finish(manifest, run_dir)
+
     client = AigClient(
         base_url,
         timeout=timeout,
@@ -346,6 +378,7 @@ def run_aig_scan(
         poll_interval=poll_interval,
         max_poll_seconds=max_poll_seconds,
         max_poll_attempts=max_poll_attempts,
+        redact_token=model["token"],
     )
     try:
         upload = client.upload(archive)
@@ -364,7 +397,7 @@ def run_aig_scan(
             prompt="扫描此 MCP 服务器源码中的安全风险",
             thread=4,
             language="zh",
-            model=None,
+            model=model if all(model.values()) else None,
         )
         session_id = created.get("session_id")
         if not session_id:

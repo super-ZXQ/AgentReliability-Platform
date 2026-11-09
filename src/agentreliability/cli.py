@@ -121,6 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
     matrix_parser.add_argument("--mode", choices=["offline", "model"], default="offline")
     matrix_parser.add_argument("--out", required=True)
     matrix_parser.add_argument("--spec", default=None, help="矩阵清单路径")
+    matrix_parser.add_argument("--model-slot", help="只运行清单中指定模型槽的 1×2 策略对照")
+    matrix_parser.add_argument("--smoke", action="store_true", help="在首个故障场景对每种策略运行一次")
     matrix_parser.add_argument("--incidentpilot-dir", default=None)
     matrix_parser.add_argument(
         "--timeout", type=float, default=1200.0, help="矩阵子进程超时秒数"
@@ -591,6 +593,8 @@ def _run_matrix_cli(args: argparse.Namespace, raw_argv: list[str]) -> int:
         mode=args.mode,
         command=_command(raw_argv),
         spec_path=args.spec,
+        model_slot=args.model_slot,
+        smoke=args.smoke,
         incidentpilot_dir=args.incidentpilot_dir,
         timeout=args.timeout,
     )

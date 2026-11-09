@@ -81,6 +81,11 @@ OpenJudge 固定在 `b83f446b09821257da9c2070ca405fa71cc22690`，使用其独立
 
 每次运行写入 `runs/<UTC 时间>-<运行 ID>/`：`samples.json`、`predictions.json`、`manifest.json` 与 `report.html`。报告分别给出清晰样本一致率、边界样本分布、误判与分歧例。
 
+使用 `deepseek-flash` 对 10 条校准样本完成真实语义评分。清晰样本与项目标签一致 6/7，包含边界样本的偏好一致 8/10，执行错误 0。分歧之一是 cal-01，证据只有单个请求速率读数，诊断却称请求速率保持稳定。保留原始标签供人工复核。留出集 8 条待人工审核。
+
+- 校准报告 `artifacts/openjudge-deepseek.DEbagn/runs/20261108T144502Z-d184e585/report.html`
+- 留出集复核表 `artifacts/openjudge-deepseek.DEbagn/holdout-review.md`
+
 ## 2×2 矩阵
 
 矩阵清单 `benchmarks/matrix/pawbench-2x2.json` 固定两个模型槽、`fixed`/`autonomous` 两种策略、两个故障场景、每组合 2 次重复，以及判定器和预算；参考 PawBench `0f794a8bb6c27aa9ee4091b2691fa30e4ed9cc8f` 的重复运行结构，本矩阵不是 PawBench 官方榜单。
@@ -93,6 +98,22 @@ IncidentPilot 默认查找 `.targets/incidentpilot` 或 `~/Developer/GitHub/inci
 
 产物包含 `trials.json`、`manifest.json`（按模型 × 策略与场景汇总、真实矩阵待补状态）和 `report.html`。
 
+已有一个授权模型时，可用 `matrix --mode model --model-slot model-a` 跑 1×2 策略对照。两种策略各跑两个故障场景，每个场景重复两次。报告会标记实际矩阵范围并保留原有 2×2 入口。为专用参考服务设置 `PAWBENCH_REFERENCE_ORDERS_API_URL`，可用 `PAWBENCH_REFERENCE_LOGS_PATH` 指定同一实例的日志目录。
+
+首次联调可追加 `--smoke --timeout 420`，只在首个场景运行两种策略各一次，每次最多 180 秒。每条试验结束后立即落盘，总时限到达时保留已写入的结果。
+
+DeepSeek Flash 的慢查询联调中，固定策略约 29 秒、调用工具 4 次，调查结束但根因错误。自主策略约 150 秒、调用工具 9 次，超过 8 次工具预算并进入人工介入。原始报告总状态为 `ERROR`，其中旧版逐试验统计把两条都记为通过。现已把真实试验超预算或需要人工介入归为 `ERROR`。本轮只覆盖一个模型和一个故障，完整 2×2 实测仍需第二个已配置模型。原始本地产物位于 `artifacts/matrix-deepseek-smoke/runs/20261108T235857Z-55b08010/`。
+
+慢查询复跑使用专用 `PAWBENCH_REFERENCE_LOGS_PATH`。上游 MCP 的 `read_logs` 从最近一次故障注入开始截取日志，原先无法同时返回注入前后的请求。桥接层现在从当轮真实 HTTP 日志提取注入前 3 条和注入后 4 条 `/orders` 请求，将状态码和延迟作为 `controlled_reproduction` 观测写入当轮独立的 MCP 日志快照及矩阵报告。参考服务原日志由容器独占写入。观测不包含注入请求体、故障标签或金标。
+
+固定策略复跑的基线约 2–3 ms，注入后约 503–507 ms。模型将延迟归因于应用侧注入；固定上游源码也在记录 `select_orders` 查询耗时后才调用 `time.sleep`。现有场景仍用 `database_performance` 作为期望类别，模型输出 `application_bug`，根因评分保持为错。两次运行都只覆盖同一个慢查询场景。自主策略用满 8 次工具调用后以 `INSUFFICIENT_EVIDENCE` 结束。真实试验现在要求 `INVESTIGATION_COMPLETE` 且在预算内才计为流程完成。按新规则重算同次实测得到 1 条流程完成、1 条错误、0 条根因正确。原始记录和重算报告保存在 `artifacts/matrix-deepseek-observed/runs/20261109T010554Z-23f8ba84/`。
+
+后续使用 `orders-app-delay/v1` 校准真实慢查询场景。故障类型、0.5 秒注入参数、模型输入与预算沿用原场景，只有评测侧更新为 `application_bug`。根因判对同时要求结构化判定通过，以及引用的 `app.py` 证据覆盖 SQL 计时结束和处理器休眠分支。离线套件、其他场景和历史报告保留原判定。固定策略的源码工具默认只返回第 1–90 行，而延迟逻辑在第 160 行之后，校准复跑中，固定策略判对应用侧类别，缺少注入源码引用，严格根因仍未通过。自主策略触及 180 秒时限，未产出可评分诊断。报告位于 `artifacts/matrix-deepseek-calibrated-final/runs/20261109T014745Z-4129494d/report.html`。
+
+固定策略随后加了真实 MCP 源码分页。每次源码读取最多合并三页，校验文件和行号连续，每个后端请求都计入原有工具预算。DeepSeek Flash 的同场景复跑中，固定策略 29 秒完成，4 次逻辑工具调用对应 6 次 MCP 请求，读取了 `app.py` 第 1–255 行，类别和注入源码引用均命中。自主策略约 98 秒完成，7 次逻辑工具调用，类别命中但注入源码引用未命中。两条流程均完成，严格根因通过 1 条。报告位于 `artifacts/matrix-deepseek-paged/runs/20261109T020909Z-d976e6af/report.html`。
+
+源码引用审计将当轮成功工具调用的页码与通过哈希、运行编号和工具调用校验的证据 ID 关联，再检查最终根因是否引用该证据。报告只保留页码、文件名、工具调用和证据编号，以及命中状态。单次审计复跑中，固定策略命中并引用了注入代码。自主策略读到了 `app.py` 第 91–172 行，覆盖休眠分支，但最终以 `INSUFFICIENT_EVIDENCE` 结束，未产出根因引用。报告位于 `artifacts/matrix-deepseek-citation-audit/runs/20261109T023055Z-9387f3d6/report.html`。
+
 ## A.I.G MCP 扫描
 
 ```sh
@@ -101,6 +122,12 @@ uv run --locked agentreliability aig --out artifacts/platform/aig-real
 ```
 
 A.I.G 固定在 `76146bf479b2fedb34f7acb7f536aa37b1f8ba74`，流程为上传白名单 ZIP → 创建 `mcp_scan` 任务 → 有界轮询状态 → 拉取结果并统一展示发现。样例位于 `benchmarks/aig_samples/synthetic_mcp_server`，只含合成源码，上传时会跳过隐藏文件与非白名单后缀。实例地址缺失或不可达时写出 `NOT_RUN`；轮询超时、任务失败、统一响应 `status=1` 或结果解析失败都会写出 `ERROR`，不会生成通过状态。电商 SEC 断言仍由既有确定性套件独立负责。
+
+A.I.G 4.6.9 已用本地官方容器和 DeepSeek 模型转发服务实跑。任务状态到达 `done`，报告记录合成样例中的命令注入和路径穿越两项发现。初次调用暴露了服务端使用 `todo/doing/done/error/terminated` 的兼容问题，适配后用 CLI 复跑通过。[腾讯朱雀实验室 A.I.G](https://github.com/Tencent/AI-Infra-Guard)
+
+实例已有默认模型时可直接运行。用显式模型时，在本地终端一并配置 `AIG_MODEL`、`AIG_MODEL_BASE_URL` 和 `AIG_MODEL_TOKEN`，并将 `AIG_BASE_URL` 指向本地回环地址。本次只给 A.I.G 临时转发令牌，DeepSeek 密钥保留在本地。
+
+- 真实扫描报告 `artifacts/aig-v469-final/runs/20261108T231826Z-e18c0cd7/report.html`
 
 ## 平台化阶段报告
 
@@ -207,11 +234,14 @@ uv run --locked agentreliability run --mode live --allow-network --repeat 3 --ta
 
 `report.json` 的 `live` 字段记录模型、提供方主机、重复次数与缺失环境；`case_summaries` 按用例汇总试验数、通过/失败/错误/未执行、平均与最大耗时、模型调用次数、重试次数、提供方错误数和 token 用量。真实报告与离线报告分开存放、分开判定。
 
-本地实测状态：当前机器未设置 `LLM_API_KEY`、`LLM_BASE_URL`、`LLM_MODEL`，真实模式按设计写出 18 条 `NOT_RUN`，未伪造联网结果。配置齐全后重跑同一条命令即可生成真实抽样报告。
+本地实测使用 DeepSeek V4.1 Flash（`deepseek-flash`）和固定电商 Agent 提交。首轮 12/18 通过，其余 6 条集中在 DATA-02 和 DATA-06，原因是结果包含额外的正常业务列。修订后的 `live-result-fields-v2` 按用例要求的字段比对，保留行数和排名顺序断言。使用同一组用例重新实跑后，18/18 通过，0 失败、0 错误、0 未执行。SEC-01 的三次通过来自应用层前置拦截，模型调用为零。
+
+- 首轮报告 `artifacts/deepseek-live.FjX7Am/report.html`
+- 复跑报告 `artifacts/deepseek-live-v2.0wecSG/report.html`
 
 ## 三分钟演示
 
 1. 红灯：演示 PR 给候选注入缺失重试，`agent-regression` 检查失败（[运行 42461841558](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42461841558)）。打开 `artifacts/m3/comparison/comparison.html`，REL-01 被列为新增失败，候选执行只有一次 `error`。
 2. 轨迹定位：在 `artifacts/m3/injected/trace.jsonl` 中，REL-01 的 `sql_port` 在 `seq 167` 报错后，`seq 169` 直接进入 `agent` 的 `synthesize`；健康版在 `seq 167` 之后有 `seq 169` 的第二次 `model.generate_sql`，其 `previous_error` 为 `OperationalError：执行失败`，随后 `seq 172` 的 `sql_port` 成功。差异字段是 `executions`（期望两次、实际一次）与 `retry_context`（缺少第二次模型调用）。
 3. 绿灯：同一分支移除演示参数后检查通过（[运行 42462245235](https://github.com/super-ZXQ/AgentReliability-Platform/actions/runs/42462245235)），本地对照显示 REL-01、REL-02、REL-03 恢复，20 条保持通过。
-4. 真实模型：运行上述 `--mode live` 命令。若本机缺少凭据，展示 `artifacts/m4/live/report.html` 中 18 条 `NOT_RUN` 与具体缺失变量；配置齐全后同一页面展示 18 次任务的判定、耗时、调用次数和提供方错误。
+4. 真实模型：打开复跑报告，查看 18 次任务的判定、耗时、模型调用次数和提供方错误。用两轮报告解释字段投影导致的误报及其验证过程。

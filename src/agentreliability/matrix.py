@@ -48,6 +48,15 @@ def load_spec(path: Path | str | None = None) -> tuple[dict[str, Any], Path]:
     return spec, spec_path
 
 
+def select_model_slot(spec: dict[str, Any], model_slot: str | None) -> dict[str, Any]:
+    if model_slot is None:
+        return spec
+    selected = [model for model in spec["models"] if model["id"] == model_slot]
+    if len(selected) != 1:
+        raise ValueError(f"模型槽不存在或重复：{model_slot}")
+    return {**spec, "models": selected}
+
+
 def model_prefix(spec: dict[str, Any], model: dict[str, Any]) -> str:
     """按清单元数据解析每个模型槽独立的环境变量前缀。"""
     requirement = (spec.get("real_model_requirements") or {}).get(model["id"]) or []
@@ -153,7 +162,7 @@ def _diagnosis_trace(trials: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return trace
 
 
-def summarize(trials: list[dict[str, Any]]) -> dict[str, Any]:
+def summarize(trials: list[dict[str, Any]], *, execution_errors: int = 0) -> dict[str, Any]:
     groups: dict[str, dict[str, Any]] = {}
     for trial in trials:
         key = f"{trial['model_id']} × {trial['strategy']}"
@@ -231,6 +240,8 @@ def summarize(trials: list[dict[str, Any]]) -> dict[str, Any]:
         by_source[item["source"]] = by_source.get(item["source"], 0) + item["incorrect"]
     return {
         **totals,
+        "error": totals["error"] + execution_errors,
+        "execution_errors": execution_errors,
         "pass": totals["workflow_completed"],
         "groups": list(groups.values()),
         "by_scenario": by_scenario,
@@ -354,6 +365,8 @@ def run_matrix(
     mode: str = "offline",
     command: str = "",
     spec_path: Path | str | None = None,
+    model_slot: str | None = None,
+    smoke: bool = False,
     incidentpilot_dir: Path | str | None = None,
     timeout: float = 1200.0,
     runner=subprocess.run,
@@ -376,6 +389,8 @@ def run_matrix(
         "created_at": now.isoformat(),
         "command": command,
         "mode": mode,
+        "matrix_shape": "1×2" if model_slot else "2×2",
+        "smoke": smoke,
         "status": ERROR,
         "state": None,
         "error": None,
@@ -398,6 +413,13 @@ def run_matrix(
     }
     try:
         spec, resolved_spec = load_spec(spec_path)
+        spec = select_model_slot(spec, model_slot)
+        if smoke:
+            if not model_slot:
+                raise ValueError("冒烟对照需要指定 --model-slot")
+            spec["scenarios"] = spec["scenarios"][:1]
+            spec["repetitions"] = 1
+            spec["budget"] = {**spec["budget"], "max_seconds_per_trial": min(180, spec["budget"]["max_seconds_per_trial"])}
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         manifest["state"] = STATE_SPEC_INVALID
         manifest["error"] = f"矩阵清单不可用：{exc}"
@@ -413,12 +435,15 @@ def run_matrix(
         "judge": spec.get("judge"),
     }
     manifest["budget"] = spec.get("budget") or {}
+    slot_arg = f"--model-slot {model_slot} " if model_slot else ""
+    if smoke:
+        slot_arg += "--smoke "
     manifest["real_matrix"] = {
         "status": NOT_RUN,
         "state": STATE_MODEL_CONFIG,
         "requirements": spec.get("real_model_requirements") or {},
         "command": (
-            "uv run --locked agentreliability matrix --mode model "
+            f"uv run --locked agentreliability matrix --mode model {slot_arg}"
             f"--incidentpilot-dir {incidentpilot_dir or '<incidentpilot>'} "
             f"--out {out}"
         ),
@@ -441,7 +466,7 @@ def run_matrix(
         if not config["configured"]:
             manifest["status"] = NOT_RUN
             manifest["state"] = STATE_MODEL_CONFIG
-            manifest["error"] = "缺少两个模型配置：" + "、".join(config["missing"])
+            manifest["error"] = "缺少所选模型配置：" + "、".join(config["missing"])
             manifest["real_matrix"]["status"] = NOT_RUN
             return _finish(manifest, run_dir, [], root)
         url = reference_orders_api(environ)
@@ -475,7 +500,7 @@ def run_matrix(
     else:
         manifest["notes"].append(
             "离线矩阵使用 IncidentPilot 的脚本化模型与合成工具，模型轴为两个占位配置，"
-            "只验证矩阵执行与汇总；真实矩阵需两个授权模型配置"
+            "只验证矩阵执行与汇总；真实矩阵需所选模型的授权配置"
         )
 
     spec_file = (run_dir / "matrix.spec.json").resolve()
@@ -523,11 +548,24 @@ def run_matrix(
         manifest["state"] = STATE_TIMEOUT
         manifest["error"] = f"矩阵执行超时（>{timeout}s）"
         if mode == "model":
+            manifest["real_matrix"]["status"] = ERROR
+            manifest["real_matrix"]["state"] = STATE_TIMEOUT
             try:
                 reset_reference(url)
             except ReferenceResetError as exc:
                 manifest["error"] += f"。{exc}"
-        return _finish(manifest, run_dir, [], root)
+        try:
+            checkpoint = json.loads(output_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            checkpoint = {}
+        trials = checkpoint.get("trials") or []
+        manifest["trials"] = trials
+        manifest["errors"] = checkpoint.get("errors") or []
+        manifest["summary"] = summarize(trials, execution_errors=len(manifest["errors"]))
+        manifest["summary"]["expected_trials"] = (
+            len(spec["models"]) * len(spec["strategies"]) * len(spec["scenarios"]) * spec["repetitions"]
+        )
+        return _finish(manifest, run_dir, trials, root)
     except OSError as exc:
         manifest["state"] = STATE_UNAVAILABLE
         manifest["error"] = f"无法启动矩阵执行：{exc}"
@@ -557,7 +595,7 @@ def run_matrix(
     )
     manifest["trials"] = trials
     manifest["errors"] = errors
-    manifest["summary"] = summarize(trials)
+    manifest["summary"] = summarize(trials, execution_errors=len(manifest["errors"]))
     manifest["summary"]["expected_trials"] = expected
     if mode == "model":
         issues = validate_real_result(spec, config, trials, payload)
@@ -576,6 +614,7 @@ def run_matrix(
                 )
             manifest["error"] = error
         manifest["real_matrix"]["status"] = status
+        manifest["real_matrix"]["state"] = state
     elif payload.get("status") != PASS or len(trials) != expected:
         manifest["status"] = ERROR
         manifest["state"] = STATE_UPSTREAM_FAILURE
@@ -652,7 +691,9 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
         f"<td>{_e(item.get('trial'))}</td>"
         f"<td>{_badge(item.get('status'))}</td>"
         f"<td>{_e(item.get('final_status'))}</td>"
+        f"<td>{_e(item.get('oracle_version') or '-')}</td>"
         f"<td>{_e((item.get('result') or {}).get('root_cause_correct'))}</td>"
+        f"<td>{_e((item.get('result') or {}).get('evidence_hits_injection'))}</td>"
         f"<td>{_e((item.get('result') or {}).get('expected_category') or '-')}</td>"
         f"<td>{_e((item.get('result') or {}).get('predicted_category') or '-')}</td>"
         f"<td>{_e((item.get('result') or {}).get('tool_selection_score'))}</td>"
@@ -660,6 +701,25 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
         f"<td>{_e((item.get('usage') or {}).get('tokens'))}</td>"
         "</tr>"
         for item in trials
+    )
+    observations = "".join(
+        f"<details><summary>{_e(item.get('strategy'))} · {_e(item.get('scenario'))} · {_e(item.get('trial'))}</summary>"
+        f"<pre>{_json(item['reproduction_observation'])}</pre></details>"
+        for item in trials
+        if item.get("reproduction_observation")
+    )
+    source_reads = "".join(
+        f"<details><summary>{_e(item.get('model_id'))} · {_e(item.get('scenario'))} · {_e(item.get('trial'))}</summary>"
+        f"<pre>{_json(item['fixed_source_audit'])}</pre></details>"
+        for item in trials
+        if item.get("fixed_source_audit")
+    )
+    citation_reads = "".join(
+        f"<details><summary>{_e(item.get('strategy'))} · {_e(item.get('scenario'))} · "
+        f"{_e(item['source_citation_audit']['verdict'])}</summary>"
+        f"<pre>{_json(item['source_citation_audit'])}</pre></details>"
+        for item in trials
+        if item.get("source_citation_audit")
     )
     trace_rows = "".join(
         "<tr>"
@@ -694,20 +754,20 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
         f"<td>{_e(item.get('trial'))}</td>"
         f"<td>{_e(item.get('error'))}</td>"
         "</tr>"
-        for item in manifest.get("errors", [])
+        for item in [*manifest.get("errors", []), *(trial for trial in trials if trial.get("error"))]
     )
     return f"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>2×2 矩阵 {_e(manifest['run_id'][:8])}</title><style>{_CSS}</style></head>
+<title>{_e(manifest.get('matrix_shape', '2×2'))} 矩阵 {_e(manifest['run_id'][:8])}</title><style>{_CSS}</style></head>
 <body><main>
-<h1>模型 × Harness 2×2 矩阵</h1>
+<h1>模型 × Harness {_e(manifest.get('matrix_shape', '2×2'))} {'冒烟对照' if manifest.get('smoke') else '矩阵'}</h1>
 <p class="muted">参考 PawBench：固定场景、数据、判定器与预算；本项目实验</p>
 <div class="meta">
 <div>状态：{_badge(manifest.get('status'))} {_e(manifest.get('state') or '')}</div>
 <div>模式：{_e(manifest['mode'])} ｜ 执行方式：{_e(manifest['execution_mode'])}</div>
 <div>场景源码：{_e(manifest['target'].get('repository'))} @ {_e(manifest['target'].get('commit'))} ｜ 已验证：{_e(manifest['target'].get('commit_verified'))}</div>
 <div>预算：{_e(_json(manifest.get('budget')))}</div>
-<div>真实矩阵：{_badge(manifest['real_matrix'].get('status') or 'NOT_RUN')} {_e(manifest['real_matrix'].get('error') or '待两个授权模型配置')}</div>
+<div>真实矩阵：{_badge(manifest['real_matrix'].get('status') or 'NOT_RUN')} {_e(manifest['real_matrix'].get('error') or '待所选模型的授权配置')}</div>
 <div>根因差异：{_e(_json(discrepancy))}</div>
 {_e(manifest.get('error') or '')}
 </div>
@@ -722,8 +782,11 @@ def render_matrix_html(manifest: dict[str, Any], trials: list[dict[str, Any]]) -
 <table><thead><tr><th>模型</th><th>预期类别（金标）</th><th>实际类别（模型输出）</th><th>样本</th><th>正确</th><th>错误</th><th>别名覆盖</th><th>差异来源</th></tr></thead>
 <tbody>{trace_rows or '<tr><td colspan=8 class="muted">无</td></tr>'}</tbody></table>
 <h2>逐次试验</h2>
-<table><thead><tr><th>模型</th><th>策略</th><th>场景</th><th>试验</th><th>状态</th><th>最终状态</th><th>根因正确</th><th>预期类别</th><th>实际类别</th><th>工具选择</th><th>耗时(s)</th><th>用量</th></tr></thead>
-<tbody>{trial_rows or '<tr><td colspan=12 class="muted">无</td></tr>'}</tbody></table>
+<table><thead><tr><th>模型</th><th>策略</th><th>场景</th><th>试验</th><th>状态</th><th>最终状态</th><th>判定器</th><th>根因正确</th><th>引用命中注入代码</th><th>预期类别</th><th>实际类别</th><th>工具选择</th><th>耗时(s)</th><th>用量</th></tr></thead>
+<tbody>{trial_rows or '<tr><td colspan=14 class="muted">无</td></tr>'}</tbody></table>
+{'<h2>复现观测</h2>' + observations if observations else ''}
+{'<h2>固定策略源码分页</h2>' + source_reads if source_reads else ''}
+{'<h2>源码引用追溯</h2>' + citation_reads if citation_reads else ''}
 <h2>失败</h2>
 <table><thead><tr><th>模型</th><th>策略</th><th>场景</th><th>试验</th><th>错误</th></tr></thead>
 <tbody>{error_rows or '<tr><td colspan=5 class="muted">无</td></tr>'}</tbody></table>

@@ -329,3 +329,44 @@ def test_normalization_handles_nested_and_unrecognized_shapes():
     empty = normalize_findings({"report": "no structured findings"})
     assert empty["total"] == 0
     assert empty["normalization"] == "unrecognized"
+
+
+def test_v469_statuses_and_explicit_local_model(tmp_path):
+    token = "local-relay-test-secret"
+    fake = _transport(
+        {
+            "upload": [_envelope({"fileUrl": "http://aig/uploads/source.zip"})],
+            "tasks": [_envelope({"session_id": "S-1", "echo": token})],
+            "status": [
+                _envelope({"status": "todo"}),
+                _envelope({"status": "doing"}),
+                _envelope({"status": "done"}),
+            ],
+            "result": [_envelope({"result": {"results": [{"title": "Example", "severity": "high"}]}})],
+        }
+    )
+
+    def transport(method, url, body, headers, timeout):
+        if url.endswith("/tasks"):
+            assert json.loads(body)["content"]["model"] == {
+                "model": "example",
+                "base_url": "http://relay/v1",
+                "token": token,
+            }
+        return fake(method, url, body, headers, timeout)
+
+    manifest, run_dir = run_aig_scan(
+        out=tmp_path,
+        base_url="http://127.0.0.1:18088",
+        transport=transport,
+        poll_interval=0,
+        environ={
+            "AIG_MODEL": "example",
+            "AIG_MODEL_BASE_URL": "http://relay/v1",
+            "AIG_MODEL_TOKEN": token,
+        },
+    )
+    assert manifest["status"] == "PASS"
+    assert manifest["polling"]["final_status"] == "done"
+    assert manifest["findings"]["total"] == 1
+    assert token not in (run_dir / "task.json").read_text()
