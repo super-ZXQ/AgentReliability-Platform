@@ -1,0 +1,22 @@
+{
+  "version": "v1",
+  "samples_file": "v1.json",
+  "samples_sha256": "a8a4afd9041c33a808cce7a2ee10d223c883325b74c38ad41473abfa62b5033c",
+  "frozen_at": "2026-11-08",
+  "split_counts": {
+    "calibration": 10,
+    "holdout": 8
+  },
+  "label_counts": {
+    "supported": 7,
+    "unsupported": 7,
+    "borderline": 4
+  },
+  "labels_human_reviewed": false,
+  "label_source": "project-authored from IncidentPilot fault_002_slow_database_query evidence bundles; human review pending",
+  "grader": {
+    "name": "reasoning_groundedness",
+    "repository": "https://github.com/agentscope-ai/OpenJudge",
+    "commit": "b83f446b09821257da9c2070ca405fa71cc22690"
+  }
+}

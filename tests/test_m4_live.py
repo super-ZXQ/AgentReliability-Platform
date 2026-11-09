@@ -231,3 +231,25 @@ def test_offline_rejects_live_only_flags(tmp_path, target):
     ]
     assert main(base + ["--repeat", "2"]) == 2
     assert main(base + ["--allow-network"]) == 2
+
+
+def test_live_projection_preserves_required_fields_and_order():
+    from agentreliability.live import judge_live_case
+
+    detail = {"case_id": "DATA-02", "expected_rows": [{"order_id": 101}, {"order_id": 102}], "ordered": True}
+    rows = [{"order_id": 102, "platform": "京东"}, {"order_id": 101, "platform": "淘宝"}]
+    assert judge_live_case(detail, {"rows": rows})["verdict"] == "PASS"
+    assert judge_live_case(detail, {"rows": rows + [rows[0]]})["verdict"] == "FAIL"
+    top = {
+        "case_id": "DATA-06",
+        "expected_rows": [{"order_id": 103, "payment_amount": 50}, {"order_id": 102, "payment_amount": 30}],
+        "ordered": True,
+    }
+    ranked = [dict(row, platform="测试") for row in top["expected_rows"]]
+    assert judge_live_case(top, {"rows": ranked})["verdict"] == "PASS"
+    assert judge_live_case(top, {"rows": ranked[::-1]})["verdict"] == "FAIL"
+    ranked[0].update(order_id=50, payment_amount=103)
+    assert judge_live_case(top, {"rows": ranked})["verdict"] == "FAIL"
+    assert judge_live_case({"case_id": "DATA-01", "expected_rows": [{"sales": 42}]}, {
+        "rows": [{"sales_amount": 42}],
+    })["verdict"] == "PASS"

@@ -21,7 +21,11 @@ from .live import (
     select_live_cases,
 )
 from .oracle import ERROR, FAIL, NOT_RUN
+from .aig import aig_exit_code, run_aig_scan
+from .matrix import matrix_exit_code, run_matrix
+from .quality import quality_exit_code, run_quality
 from .report import build_report, write_artifacts
+from .semantic import run_semantic_evaluation, semantic_exit_code
 from .runner import load_cases, not_run_results, run_cases_sync
 from .target import TargetError, verify_target
 
@@ -67,6 +71,78 @@ def build_parser() -> argparse.ArgumentParser:
     compare_parser.add_argument("baseline", help="基线 report.json")
     compare_parser.add_argument("candidate", help="候选 report.json")
     compare_parser.add_argument("--out", required=True, help="对比产物目录")
+
+    quality_parser = subparsers.add_parser(
+        "quality", help="运行平台化质量闭环场景并生成运行清单"
+    )
+    quality_parser.add_argument("--scenario", required=True, help="闭环场景 ID")
+    quality_parser.add_argument(
+        "--out", required=True, help="产物根目录；每次运行写入新的 runs/<时间>-<ID>"
+    )
+    quality_parser.add_argument(
+        "--incidentpilot-dir", default=None, help="IncidentPilot checkout"
+    )
+    quality_parser.add_argument(
+        "--vibecheck-dir", default=None, help="VibeCheck-AI checkout"
+    )
+    quality_parser.add_argument(
+        "--timeout", type=float, default=180.0, help="扫描子进程超时秒数"
+    )
+    quality_parser.add_argument(
+        "--investigation-timeout",
+        type=float,
+        default=600.0,
+        help="调查与沙箱复测子进程超时秒数",
+    )
+
+    semantic_parser = subparsers.add_parser(
+        "semantic", help="OpenJudge 证据支持语义评分（独立展示）"
+    )
+    semantic_parser.add_argument(
+        "--split", choices=["calibration", "holdout"], default="calibration"
+    )
+    semantic_parser.add_argument(
+        "--mode", choices=["offline", "model"], default="offline"
+    )
+    semantic_parser.add_argument(
+        "--out", required=True, help="产物根目录；每次运行写入新的 runs/<时间>-<ID>"
+    )
+    semantic_parser.add_argument("--openjudge-dir", default=None, help="OpenJudge checkout")
+    semantic_parser.add_argument(
+        "--samples-dir", default=None, help="冻结样本目录（默认 benchmarks/semantic_groundedness）"
+    )
+    semantic_parser.add_argument(
+        "--timeout", type=float, default=300.0, help="评分子进程超时秒数"
+    )
+
+    matrix_parser = subparsers.add_parser(
+        "matrix", help="PawBench 参考的模型 × Harness 2×2 矩阵"
+    )
+    matrix_parser.add_argument("--mode", choices=["offline", "model"], default="offline")
+    matrix_parser.add_argument("--out", required=True)
+    matrix_parser.add_argument("--spec", default=None, help="矩阵清单路径")
+    matrix_parser.add_argument("--model-slot", help="只运行清单中指定模型槽的 1×2 策略对照")
+    matrix_parser.add_argument("--smoke", action="store_true", help="在首个故障场景对每种策略运行一次")
+    matrix_parser.add_argument("--incidentpilot-dir", default=None)
+    matrix_parser.add_argument(
+        "--timeout", type=float, default=1200.0, help="矩阵子进程超时秒数"
+    )
+
+    aig_parser = subparsers.add_parser(
+        "aig", help="腾讯 A.I.G MCP 源码扫描（白名单合成样例）"
+    )
+    aig_parser.add_argument(
+        "--out", required=True, help="产物根目录；每次运行写入新的 runs/<时间>-<ID>"
+    )
+    aig_parser.add_argument("--base-url", default=None, help="本地 A.I.G 实例地址")
+    aig_parser.add_argument("--sample-dir", default=None, help="白名单样例目录")
+    aig_parser.add_argument("--timeout", type=float, default=30.0, help="单次 HTTP 超时")
+    aig_parser.add_argument(
+        "--poll-seconds", type=float, default=600.0, help="有界轮询总时长"
+    )
+    aig_parser.add_argument(
+        "--poll-interval", type=float, default=2.0, help="轮询间隔秒数"
+    )
     return parser
 
 
@@ -446,6 +522,126 @@ def _run_compare(args: argparse.Namespace, raw_argv: list[str]) -> int:
     return 0
 
 
+def _run_quality(args: argparse.Namespace, raw_argv: list[str]) -> int:
+    try:
+        manifest, run_dir = run_quality(
+            scenario_id=args.scenario,
+            out=args.out,
+            command=_command(raw_argv),
+            incidentpilot_dir=args.incidentpilot_dir,
+            vibecheck_dir=args.vibecheck_dir,
+            timeout=args.timeout,
+            investigation_timeout=args.investigation_timeout,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    for item in manifest["subtasks"]:
+        state = f" [{item['state']}]" if item.get("state") else ""
+        expected = (
+            "（预期失败）" if item.get("expected_status") == FAIL else ""
+        )
+        print(f"{item['status']} {item['name']}{state}{expected}")
+        if item.get("error"):
+            print(f"  原因：{item['error']}", file=sys.stderr)
+    summary = manifest["summary"]
+    print(
+        f"{summary['verdict']} 子任务 {summary['total']}，"
+        f"通过 {summary['pass']}，失败 {summary['fail']}，"
+        f"错误 {summary['error']}，未执行 {summary['not_run']}"
+    )
+    print(f"场景：{manifest['scenario']['id']}（注入的模拟延迟）")
+    print(f"运行目录：{run_dir}")
+    print(f"清单：{run_dir / 'manifest.json'}")
+    print(f"扫描：{run_dir / 'scan.json'}")
+    print(f"HTML：{run_dir / 'report.html'}")
+    return quality_exit_code(manifest)
+
+
+def _run_semantic(args: argparse.Namespace, raw_argv: list[str]) -> int:
+    manifest, run_dir = run_semantic_evaluation(
+        split=args.split,
+        out=args.out,
+        mode=args.mode,
+        command=_command(raw_argv),
+        openjudge_dir=args.openjudge_dir,
+        samples_dir=args.samples_dir,
+        timeout=args.timeout,
+    )
+    state = f" [{manifest['state']}]" if manifest.get("state") else ""
+    print(f"{manifest['status']} {manifest['split']} {manifest['mode']}{state}")
+    if manifest.get("error"):
+        print(f"  原因：{manifest['error']}", file=sys.stderr)
+    metrics = manifest.get("metrics") or {}
+    if metrics:
+        print(
+            f"清晰样本一致率 {metrics.get('clear_accuracy')}，"
+            f"偏好一致率 {metrics.get('preferred_agreement_rate')}，"
+            f"误判 {len(metrics.get('misjudgments') or [])}，"
+            f"分歧 {len(metrics.get('disagreements') or [])}"
+        )
+    print(f"执行方式：{manifest['execution_mode']}（独立展示，不参与离线硬门禁）")
+    print(f"运行目录：{run_dir}")
+    print(f"清单：{run_dir / 'manifest.json'}")
+    print(f"HTML：{run_dir / 'report.html'}")
+    return semantic_exit_code(manifest["status"])
+
+
+def _run_matrix_cli(args: argparse.Namespace, raw_argv: list[str]) -> int:
+    manifest, run_dir = run_matrix(
+        out=args.out,
+        mode=args.mode,
+        command=_command(raw_argv),
+        spec_path=args.spec,
+        model_slot=args.model_slot,
+        smoke=args.smoke,
+        incidentpilot_dir=args.incidentpilot_dir,
+        timeout=args.timeout,
+    )
+    state = f" [{manifest['state']}]" if manifest.get("state") else ""
+    print(f"{manifest['status']} matrix {manifest['mode']}{state}")
+    if manifest.get("error"):
+        print(f"  原因：{manifest['error']}", file=sys.stderr)
+    summary = manifest.get("summary") or {}
+    if summary:
+        print(
+            f"试验 {summary.get('trials')}/{summary.get('expected_trials')}，"
+            f"通过 {summary.get('pass')}，错误 {summary.get('error')}"
+        )
+        for group in summary.get("groups", []):
+            print(
+                f"  {group['model_id']} × {group['strategy']}："
+                f"{group['trials']} 次，根因准确率 {group['root_cause_accuracy']}"
+            )
+    print(f"真实矩阵：{manifest['real_matrix'].get('status') or 'NOT_RUN'}")
+    print(f"运行目录：{run_dir}")
+    print(f"清单：{run_dir / 'manifest.json'}")
+    print(f"HTML：{run_dir / 'report.html'}")
+    return matrix_exit_code(manifest["status"])
+
+
+def _run_aig_cli(args: argparse.Namespace, raw_argv: list[str]) -> int:
+    manifest, run_dir = run_aig_scan(
+        out=args.out,
+        base_url=args.base_url,
+        command=_command(raw_argv),
+        sample_dir=args.sample_dir,
+        timeout=args.timeout,
+        poll_interval=args.poll_interval,
+        max_poll_seconds=args.poll_seconds,
+    )
+    state = f" [{manifest['state']}]" if manifest.get("state") else ""
+    print(f"{manifest['status']} aig{state}")
+    if manifest.get("error"):
+        print(f"  原因：{manifest['error']}", file=sys.stderr)
+    print(f"执行方式：{manifest['execution_mode']}")
+    print(f"发现：{manifest['findings'].get('total', 0)}")
+    print(f"运行目录：{run_dir}")
+    print(f"清单：{run_dir / 'manifest.json'}")
+    print(f"HTML：{run_dir / 'report.html'}")
+    return aig_exit_code(manifest["status"])
+
+
 def main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -457,6 +653,14 @@ def main(argv: list[str] | None = None) -> int:
             return _run(args, raw_argv)
         if args.command == "compare":
             return _run_compare(args, raw_argv)
+        if args.command == "quality":
+            return _run_quality(args, raw_argv)
+        if args.command == "semantic":
+            return _run_semantic(args, raw_argv)
+        if args.command == "matrix":
+            return _run_matrix_cli(args, raw_argv)
+        if args.command == "aig":
+            return _run_aig_cli(args, raw_argv)
         return 2
     except Exception as exc:  # noqa: BLE001 - CLI 必须返回稳定退出码
         print(f"运行失败：{type(exc).__name__}: {exc}", file=sys.stderr)
